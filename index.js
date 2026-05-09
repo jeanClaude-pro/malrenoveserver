@@ -170,7 +170,7 @@ app.use('/api', (req, res) => {
 });
 
 // SPA fallback — all non-API routes return index.html
-app.get('/*', (req, res) => {
+app.use((req, res) => {
   res.sendFile(path.join(clientDistPath, 'index.html'));
 });
 
