@@ -134,7 +134,58 @@ router.get("/", authMiddleware, async (req, res) => {
     });
   } catch (error) {
     console.error("Error fetching car trips:", error);
-    res.status(500).json({ error: "Failed to fetch car trips" });
+    res.status(500).json({ error: "Failed to fetch car trips", details: process.env.NODE_ENV !== "production" ? error.message : undefined });
+  }
+});
+
+// ==================== GET STATISTICS ====================
+router.get("/stats/summary", authMiddleware, async (req, res) => {
+  try {
+    const { year, month } = req.query;
+    
+    let startDate, endDate;
+    
+    if (year && month) {
+      const yearNum = parseInt(year, 10);
+      const monthNum = parseInt(month, 10) - 1;
+      startDate = new Date(yearNum, monthNum, 1);
+      endDate = new Date(yearNum, monthNum + 1, 0);
+      endDate.setHours(23, 59, 59, 999);
+    } else {
+      // Default to current month
+      const now = new Date();
+      startDate = new Date(now.getFullYear(), now.getMonth(), 1);
+      endDate = new Date(now.getFullYear(), now.getMonth() + 1, 0);
+      endDate.setHours(23, 59, 59, 999);
+    }
+    
+    const trips = await CarTrip.find({
+      createdAt: { $gte: startDate, $lte: endDate },
+    });
+    
+    const stats = {
+      period: {
+        start: startDate,
+        end: endDate,
+      },
+      totalTrips: trips.length,
+      byStatus: {
+        planned: trips.filter(t => t.status === "planned").length,
+        en_route: trips.filter(t => t.status === "en_route").length,
+        arrived: trips.filter(t => t.status === "arrived").length,
+        completed: trips.filter(t => t.status === "completed").length,
+        cancelled: trips.filter(t => t.status === "cancelled").length,
+      },
+      totalPiecesTransported: trips.reduce((sum, t) => sum + (t.cargo?.totalPieces || 0), 0),
+      totalValue: trips.reduce((sum, t) => sum + (t.cargo?.value || 0), 0),
+      totalCost: trips.reduce((sum, t) => sum + (t.totalCost || 0), 0),
+      averageTripCost: trips.length > 0 ? trips.reduce((sum, t) => sum + t.totalCost, 0) / trips.length : 0,
+    };
+    
+    res.json(stats);
+  } catch (error) {
+    console.error("Error fetching trip statistics:", error);
+    res.status(500).json({ error: "Failed to fetch statistics" });
   }
 });
 
@@ -156,7 +207,7 @@ router.get("/:id", authMiddleware, async (req, res) => {
     if (error.name === "CastError") {
       return res.status(400).json({ error: "Invalid trip ID format" });
     }
-    res.status(500).json({ error: "Failed to fetch car trip" });
+    res.status(500).json({ error: "Failed to fetch car trip", details: process.env.NODE_ENV !== "production" ? error.message : undefined });
   }
 });
 
@@ -250,12 +301,18 @@ router.post("/", authMiddleware, async (req, res) => {
       data: trip,
     });
   } catch (error) {
-    console.error("Error creating car trip:", error);
+    console.error("Error creating car trip:", error.name, error.message);
     if (error.name === "ValidationError") {
       const errors = Object.values(error.errors).map((e) => e.message);
       return res.status(400).json({ error: errors.join(", ") });
     }
-    res.status(500).json({ error: "Failed to create car trip" });
+    if (error.name === "CastError") {
+      return res.status(400).json({ error: `Invalid value for field: ${error.path}` });
+    }
+    if (error.code === 11000) {
+      return res.status(409).json({ error: "Duplicate trip ID, please retry" });
+    }
+    res.status(500).json({ error: "Failed to create car trip", details: process.env.NODE_ENV !== "production" ? error.message : undefined });
   }
 });
 
@@ -311,8 +368,11 @@ router.patch("/:id/status", authMiddleware, async (req, res) => {
       data: trip,
     });
   } catch (error) {
-    console.error("Error updating trip status:", error);
-    res.status(500).json({ error: "Failed to update trip status" });
+    console.error("Error updating trip status:", error.name, error.message);
+    if (error.name === "CastError") {
+      return res.status(400).json({ error: "Invalid trip ID format" });
+    }
+    res.status(500).json({ error: "Failed to update trip status", details: process.env.NODE_ENV !== "production" ? error.message : undefined });
   }
 });
 
@@ -460,12 +520,15 @@ router.put("/:id", authMiddleware, async (req, res) => {
       data: trip,
     });
   } catch (error) {
-    console.error("Error updating car trip:", error);
+    console.error("Error updating car trip:", error.name, error.message);
     if (error.name === "ValidationError") {
       const errors = Object.values(error.errors).map((e) => e.message);
       return res.status(400).json({ error: errors.join(", ") });
     }
-    res.status(500).json({ error: "Failed to update car trip" });
+    if (error.name === "CastError") {
+      return res.status(400).json({ error: `Invalid value for field: ${error.path}` });
+    }
+    res.status(500).json({ error: "Failed to update car trip", details: process.env.NODE_ENV !== "production" ? error.message : undefined });
   }
 });
 
@@ -488,62 +551,11 @@ router.delete("/:id", authMiddleware, async (req, res) => {
       message: "Car trip deleted successfully",
     });
   } catch (error) {
-    console.error("Error deleting car trip:", error);
+    console.error("Error deleting car trip:", error.name, error.message);
     if (error.name === "CastError") {
       return res.status(400).json({ error: "Invalid trip ID format" });
     }
-    res.status(500).json({ error: "Failed to delete car trip" });
-  }
-});
-
-// ==================== GET STATISTICS ====================
-router.get("/stats/summary", authMiddleware, async (req, res) => {
-  try {
-    const { year, month } = req.query;
-    
-    let startDate, endDate;
-    
-    if (year && month) {
-      const yearNum = parseInt(year, 10);
-      const monthNum = parseInt(month, 10) - 1;
-      startDate = new Date(yearNum, monthNum, 1);
-      endDate = new Date(yearNum, monthNum + 1, 0);
-      endDate.setHours(23, 59, 59, 999);
-    } else {
-      // Default to current month
-      const now = new Date();
-      startDate = new Date(now.getFullYear(), now.getMonth(), 1);
-      endDate = new Date(now.getFullYear(), now.getMonth() + 1, 0);
-      endDate.setHours(23, 59, 59, 999);
-    }
-    
-    const trips = await CarTrip.find({
-      createdAt: { $gte: startDate, $lte: endDate },
-    });
-    
-    const stats = {
-      period: {
-        start: startDate,
-        end: endDate,
-      },
-      totalTrips: trips.length,
-      byStatus: {
-        planned: trips.filter(t => t.status === "planned").length,
-        en_route: trips.filter(t => t.status === "en_route").length,
-        arrived: trips.filter(t => t.status === "arrived").length,
-        completed: trips.filter(t => t.status === "completed").length,
-        cancelled: trips.filter(t => t.status === "cancelled").length,
-      },
-      totalPiecesTransported: trips.reduce((sum, t) => sum + (t.cargo?.totalPieces || 0), 0),
-      totalValue: trips.reduce((sum, t) => sum + (t.cargo?.value || 0), 0),
-      totalCost: trips.reduce((sum, t) => sum + (t.totalCost || 0), 0),
-      averageTripCost: trips.length > 0 ? trips.reduce((sum, t) => sum + t.totalCost, 0) / trips.length : 0,
-    };
-    
-    res.json(stats);
-  } catch (error) {
-    console.error("Error fetching trip statistics:", error);
-    res.status(500).json({ error: "Failed to fetch statistics" });
+    res.status(500).json({ error: "Failed to delete car trip", details: process.env.NODE_ENV !== "production" ? error.message : undefined });
   }
 });
 

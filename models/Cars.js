@@ -182,16 +182,11 @@ const carTripSchema = new mongoose.Schema(
 );
 
 // Pre-save middleware to calculate total pieces and total cost
-carTripSchema.pre("save", function (next) {
-  // Calculate total pieces
+carTripSchema.pre("save", async function () {
   if (this.cargo.boxesCount && this.cargo.piecesPerBox) {
     this.cargo.totalPieces = this.cargo.boxesCount * this.cargo.piecesPerBox;
   }
-  
-  // Calculate total cost
   this.totalCost = (this.fuelCost || 0) + (this.tollCost || 0) + (this.otherCosts || 0);
-  
-  next();
 });
 
 // Indexes for better query performance
@@ -202,4 +197,4 @@ carTripSchema.index({ "driver.phone": 1 });
 carTripSchema.index({ "vehicle.plateNumber": 1 });
 carTripSchema.index({ createdAt: -1 });
 
-module.exports = mongoose.model("CarTrip", carTripSchema);
+module.exports = mongoose.models.CarTrip || mongoose.model("CarTrip", carTripSchema);

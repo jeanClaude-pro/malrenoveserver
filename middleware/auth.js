@@ -2,7 +2,6 @@ const jwt = require("jsonwebtoken");
 const User = require("../models/User");
 
 async function authMiddleware(req, res, next) {
-  // Get token from header
   const authHeader = req.header("Authorization");
   if (!authHeader || !authHeader.startsWith("Bearer ")) {
     return res.status(401).json({ message: "No token, authorization denied" });
@@ -11,28 +10,28 @@ async function authMiddleware(req, res, next) {
   const token = authHeader.split(" ")[1];
 
   try {
-    // Verify token
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
 
-    const user = await User.findById(decoded.id).select("-password");
+    // Use lean() so req.user is a plain JS object — avoids Mongoose document quirks
+    const user = await User.findById(decoded.id).select("-password").lean();
 
     if (!user) {
       return res.status(401).json({ message: "User not found" });
     }
 
-    req.user = user;
-    
-    // ✅ ADD THESE PERMISSION FLAGS
-    req.user.canValidate = user.role === 'admin' || user.role === 'manager';
-    req.user.isAdmin = user.role === 'admin';
-    
-    // ✅ Also add these for compatibility
-    req.user.id = user._id.toString();
-    req.user.userId = user._id.toString();
+    const userId = user._id.toString();
+    req.user = {
+      ...user,
+      id: userId,
+      userId,
+      name: user.username,
+      canValidate: user.role === "admin" || user.role === "manager",
+      isAdmin: user.role === "admin",
+    };
 
-    next(); // continue to next middleware/route
+    next();
   } catch (err) {
-    console.error("Invalid token:", err.message);
+    console.error("Auth error:", err.message);
     res.status(401).json({ message: "Token is not valid" });
   }
 }
