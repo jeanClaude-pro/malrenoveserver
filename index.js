@@ -3,6 +3,7 @@ const express = require("express");
 const mongoose = require("mongoose");
 const cors = require("cors");
 const morgan = require("morgan");
+const path = require("path");
 
 const app = express();
 
@@ -138,11 +139,6 @@ routes.forEach(route => {
   console.log(`✅ Loaded route: ${route.path} -> ${route.file}`);
 });
 
-// Default route
-app.get("/", (req, res) => {
-  res.send("ERP/POS System Backend is running...");
-});
-
 // Health check endpoint
 app.get("/health", (req, res) => {
   const dbState = mongoose.connection.readyState;
@@ -164,11 +160,18 @@ app.get("/health", (req, res) => {
   });
 });
 
-// 404 handler
-app.use((req, res) => {
-  res.status(404).json({
-    message: `Route ${req.method} ${req.path} not found`
-  });
+// Serve React frontend in production
+const clientDistPath = path.join(__dirname, '..', 'client', 'dist');
+app.use(express.static(clientDistPath));
+
+// 404 for unknown API routes
+app.use('/api', (req, res) => {
+  res.status(404).json({ message: `Route ${req.method} ${req.path} not found` });
+});
+
+// SPA fallback — all non-API routes return index.html
+app.get('*', (req, res) => {
+  res.sendFile(path.join(clientDistPath, 'index.html'));
 });
 
 // Error handling middleware
