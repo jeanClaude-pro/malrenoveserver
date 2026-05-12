@@ -241,23 +241,17 @@ router.post("/", authMiddleware, async (req, res) => {
       return res.status(400).json({ error: "Vehicle plate number is required" });
     }
     
-    if (!cargo?.productId || !cargo?.boxesCount || !cargo?.piecesPerBox) {
-      return res.status(400).json({ error: "Cargo product, boxes count, and pieces per box are required" });
+    if (!cargo?.productName?.trim() || !cargo?.boxesCount || !cargo?.piecesPerBox) {
+      return res.status(400).json({ error: "Cargo product name, boxes count, and pieces per box are required" });
     }
-    
-    if (!departureTime || !expectedArrivalTime) {
-      return res.status(400).json({ error: "Departure time and expected arrival time are required" });
+
+    if (!departureTime) {
+      return res.status(400).json({ error: "Departure time is required" });
     }
-    
-    // Verify product exists
-    const product = await Product.findById(cargo.productId);
-    if (!product) {
-      return res.status(400).json({ error: "Product not found" });
-    }
-    
+
     // Calculate total pieces
     const totalPieces = cargo.boxesCount * cargo.piecesPerBox;
-    
+
     // Create trip
     const trip = new CarTrip({
       tripId: generateTripId(),
@@ -274,8 +268,7 @@ router.post("/", authMiddleware, async (req, res) => {
         capacity: vehicle.capacity || 0,
       },
       cargo: {
-        productId: cargo.productId,
-        productName: product.name,
+        productName: cargo.productName.trim(),
         boxesCount: cargo.boxesCount,
         piecesPerBox: cargo.piecesPerBox,
         totalPieces: totalPieces,
@@ -283,12 +276,12 @@ router.post("/", authMiddleware, async (req, res) => {
         value: cargo.value || 0,
       },
       departureTime: new Date(departureTime),
-      expectedArrivalTime: new Date(expectedArrivalTime),
+      expectedArrivalTime: expectedArrivalTime ? new Date(expectedArrivalTime) : null,
       fuelCost: fuelCost || 0,
       tollCost: tollCost || 0,
       otherCosts: otherCosts || 0,
       notes: notes || "",
-      status: "planned",
+      status: "en_route",
       createdBy: req.user.userId,
       createdByName: req.user.name || req.user.username || "Unknown",
     });
@@ -313,6 +306,86 @@ router.post("/", authMiddleware, async (req, res) => {
       return res.status(409).json({ error: "Duplicate trip ID, please retry" });
     }
     res.status(500).json({ error: "Failed to create car trip", details: process.env.NODE_ENV !== "production" ? error.message : undefined });
+  }
+});
+
+// ==================== CONFIRM ARRIVAL (Car has arrived, record received qty) ====================
+router.patch("/:id/confirm-arrival", authMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { receivedBoxes, receivedPieces, notes, actualArrivalTime } = req.body;
+
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({ error: "Invalid trip ID" });
+    }
+
+    const rBoxes = parseInt(receivedBoxes, 10);
+    const rPieces = parseInt(receivedPieces, 10);
+
+    if (!Number.isFinite(rBoxes) || rBoxes < 0) {
+      return res.status(400).json({ error: "receivedBoxes must be a non-negative integer" });
+    }
+    if (!Number.isFinite(rPieces) || rPieces < 0) {
+      return res.status(400).json({ error: "receivedPieces must be a non-negative integer" });
+    }
+
+    const trip = await CarTrip.findById(id);
+    if (!trip) {
+      return res.status(404).json({ error: "Trip not found" });
+    }
+    if (trip.status === "arrived" || trip.status === "completed") {
+      return res.status(400).json({ error: "Trip arrival already confirmed" });
+    }
+    if (trip.status === "cancelled") {
+      return res.status(400).json({ error: "Cannot confirm arrival of a cancelled trip" });
+    }
+
+    const now = new Date();
+    const arrivalDate = actualArrivalTime ? new Date(actualArrivalTime) : now;
+    const totalReceived = rBoxes * rPieces;
+    const confirmedBy = req.user.name || req.user.username || "Unknown";
+    const previousStatus = trip.status;
+
+    trip.status = "arrived";
+    trip.actualArrivalTime = arrivalDate;
+    trip.arrivalDetails = {
+      confirmedAt: now,
+      confirmedBy,
+      receivedBoxes: rBoxes,
+      receivedPieces: rPieces,
+      totalReceivedPieces: totalReceived,
+      notes: (notes || "").trim(),
+    };
+    trip.lastModifiedBy = req.user.userId;
+    trip.lastModifiedByName = confirmedBy;
+    trip.lastUpdate = now;
+
+    trip.editHistory.push({
+      modifiedBy: req.user.userId,
+      modifiedByName: confirmedBy,
+      modifiedAt: now,
+      changes: {
+        status: { from: previousStatus, to: "arrived" },
+        receivedBoxes: rBoxes,
+        receivedPieces: rPieces,
+        totalReceivedPieces: totalReceived,
+      },
+      reason: `Arrivée confirmée — ${rBoxes} cartons × ${rPieces} pcs/carton = ${totalReceived} pcs reçues`,
+    });
+
+    await trip.save();
+
+    res.json({
+      success: true,
+      message: "Arrivée confirmée avec succès",
+      data: trip,
+    });
+  } catch (error) {
+    console.error("Error confirming arrival:", error.message);
+    if (error.name === "CastError") {
+      return res.status(400).json({ error: "Invalid ID format" });
+    }
+    res.status(500).json({ error: "Failed to confirm arrival", details: process.env.NODE_ENV !== "production" ? error.message : undefined });
   }
 });
 
@@ -443,13 +516,9 @@ router.put("/:id", authMiddleware, async (req, res) => {
     
     // Update cargo info
     if (cargo) {
-      if (cargo.productId && cargo.productId !== trip.cargo.productId?.toString()) {
-        const product = await Product.findById(cargo.productId);
-        if (product) {
-          changes.set("cargo.productName", { from: trip.cargo.productName, to: product.name });
-          trip.cargo.productId = cargo.productId;
-          trip.cargo.productName = product.name;
-        }
+      if (cargo.productName && cargo.productName.trim() !== trip.cargo.productName) {
+        changes.set("cargo.productName", { from: trip.cargo.productName, to: cargo.productName.trim() });
+        trip.cargo.productName = cargo.productName.trim();
       }
       if (cargo.boxesCount && cargo.boxesCount !== trip.cargo.boxesCount) {
         changes.set("cargo.boxesCount", { from: trip.cargo.boxesCount, to: cargo.boxesCount });

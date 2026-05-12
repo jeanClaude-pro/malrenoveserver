@@ -45,6 +45,11 @@ exchangeRateSchema.statics.getRateHistory = function(limit = 50) {
   return this.find().sort({ effectiveFrom: -1 }).limit(limit).populate('createdBy', 'username email');
 };
 
+// Static method to get the rate that was active on a given date
+exchangeRateSchema.statics.getRateForDate = function(date) {
+  return this.findOne({ effectiveFrom: { $lte: new Date(date) } }).sort({ effectiveFrom: -1 });
+};
+
 // Instance method to deactivate this rate
 exchangeRateSchema.methods.deactivate = function() {
   this.isActive = false;

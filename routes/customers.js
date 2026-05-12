@@ -2,111 +2,211 @@ const express = require("express");
 const router = express.Router();
 const Customer = require("../models/Customer");
 const Sale = require("../models/Sale");
+const authMiddleware = require("../middleware/auth");
 
-// GET /api/customers - Get all customers with optional filtering and time frame
+// All customer routes require authentication
+router.use(authMiddleware);
+
+// GET /api/customers/recent?limit=5 — last N customers by purchase date (lightweight, for dashboard)
+router.get("/recent", async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit) || 5, 20);
+    const customers = await Customer.find({ lastPurchaseDate: { $ne: null } })
+      .sort({ lastPurchaseDate: -1 })
+      .limit(limit)
+      .lean();
+    res.json(customers);
+  } catch (error) {
+    console.error("Error fetching recent customers:", error);
+    res.status(500).json({ error: "Failed to fetch recent customers" });
+  }
+});
+
+// GET /api/customers/fiche?phone=xxx — full fiche: customer + all their sales
+router.get("/fiche", async (req, res) => {
+  try {
+    const { phone } = req.query;
+    if (!phone || !phone.trim()) {
+      return res.status(400).json({ error: "Phone number is required" });
+    }
+
+    const customer = await Customer.findOne({ phone: phone.trim() }).lean();
+    if (!customer) {
+      return res.status(404).json({ error: "No customer found with that phone number" });
+    }
+
+    // Fetch all sales linked to this customer (by customerId or phone fallback)
+    const sales = await Sale.find({
+      $or: [
+        { customerId: customer._id },
+        { "customer.phone": phone.trim() },
+      ],
+      status: { $nin: ["voided", "corrected"] },
+    })
+      .sort({ createdAt: -1 })
+      .lean();
+
+    // Aggregate credit summary
+    const creditSales = sales.filter((s) => s.paymentType === "credit");
+    const totalCreditTaken = creditSales.reduce((sum, s) => sum + (s.total || 0), 0);
+    const totalCreditPaid = creditSales.reduce(
+      (sum, s) => sum + (s.creditDetails?.amountPaid || 0),
+      0
+    );
+    const totalCreditDue = creditSales.reduce(
+      (sum, s) => sum + (s.creditDetails?.amountDue || 0),
+      0
+    );
+    const unpaidCredits = creditSales.filter((s) => !s.creditDetails?.fullyPaid);
+
+    res.json({
+      customer,
+      sales,
+      summary: {
+        totalSales: sales.length,
+        totalSpent: sales.reduce((sum, s) => sum + (s.total || 0), 0),
+        totalCreditSales: creditSales.length,
+        totalCreditTaken,
+        totalCreditPaid,
+        totalCreditDue,
+        unpaidCreditsCount: unpaidCredits.length,
+      },
+    });
+  } catch (error) {
+    console.error("Error fetching customer fiche:", error);
+    res.status(500).json({ error: "Failed to fetch customer fiche" });
+  }
+});
+
+// GET /api/customers/stats/top — top customers by spending
+router.get("/stats/top", async (req, res) => {
+  try {
+    const { limit = 10, timeFrame } = req.query;
+
+    let filter = {};
+
+    if (timeFrame && timeFrame !== "all") {
+      const now = new Date();
+      let dateFilter = {};
+
+      switch (timeFrame) {
+        case "today":
+          dateFilter = { $gte: new Date(now.setHours(0, 0, 0, 0)) };
+          break;
+        case "week":
+          dateFilter = { $gte: new Date(now.setDate(now.getDate() - 7)) };
+          break;
+        case "month":
+          dateFilter = { $gte: new Date(now.setMonth(now.getMonth() - 1)) };
+          break;
+        case "year":
+          dateFilter = { $gte: new Date(now.setFullYear(now.getFullYear() - 1)) };
+          break;
+      }
+
+      filter.lastPurchaseDate = dateFilter;
+    }
+
+    const topCustomers = await Customer.find(filter)
+      .sort({ totalSpent: -1 })
+      .limit(parseInt(limit));
+
+    res.json(topCustomers);
+  } catch (error) {
+    console.error("Error fetching top customers:", error);
+    res.status(500).json({ error: "Failed to fetch top customers" });
+  }
+});
+
+// GET /api/customers — paginated list with filtering
 router.get("/", async (req, res) => {
   try {
-    const { 
-      page = 1, 
-      limit = 50, 
+    const {
+      page = 1,
+      limit = 50,
       search,
       timeFrame,
       startDate,
       endDate,
       minSpent,
-      maxSpent
+      maxSpent,
     } = req.query;
-    
-    // Build filter object
+
     const filter = {};
-    
-    // Search filter
+
     if (search) {
       filter.$or = [
         { name: { $regex: search, $options: "i" } },
         { phone: { $regex: search, $options: "i" } },
-        { email: { $regex: search, $options: "i" } }
+        { email: { $regex: search, $options: "i" } },
       ];
     }
-    
-    // Time frame filter
-    if (timeFrame && timeFrame !== 'all') {
+
+    if (timeFrame && timeFrame !== "all") {
       const now = new Date();
       let dateFilter = {};
-      
-      switch(timeFrame) {
-        case 'today':
+
+      switch (timeFrame) {
+        case "today":
           dateFilter = {
             $gte: new Date(now.setHours(0, 0, 0, 0)),
-            $lte: new Date(now.setHours(23, 59, 59, 999))
+            $lte: new Date(now.setHours(23, 59, 59, 999)),
           };
           break;
-        case 'week':
-          const weekAgo = new Date(now.setDate(now.getDate() - 7));
-          dateFilter = { $gte: weekAgo };
+        case "week":
+          dateFilter = { $gte: new Date(now.setDate(now.getDate() - 7)) };
           break;
-        case 'month':
-          const monthAgo = new Date(now.setMonth(now.getMonth() - 1));
-          dateFilter = { $gte: monthAgo };
+        case "month":
+          dateFilter = { $gte: new Date(now.setMonth(now.getMonth() - 1)) };
           break;
-        case 'year':
-          const yearAgo = new Date(now.setFullYear(now.getFullYear() - 1));
-          dateFilter = { $gte: yearAgo };
+        case "year":
+          dateFilter = { $gte: new Date(now.setFullYear(now.getFullYear() - 1)) };
           break;
-        case 'custom':
+        case "custom":
           if (startDate && endDate) {
             dateFilter = {
               $gte: new Date(startDate),
-              $lte: new Date(endDate)
+              $lte: new Date(endDate),
             };
           }
           break;
       }
-      
+
       filter.lastPurchaseDate = dateFilter;
     }
-    
-    // Spending range filter
+
     if (minSpent || maxSpent) {
       filter.totalSpent = {};
       if (minSpent) filter.totalSpent.$gte = parseFloat(minSpent);
       if (maxSpent) filter.totalSpent.$lte = parseFloat(maxSpent);
     }
-    
-    const customers = await Customer.find(filter)
-      .sort({ totalSpent: -1, lastPurchaseDate: -1 })
-      .limit(limit * 1)
-      .skip((page - 1) * limit);
-    
-    const total = await Customer.countDocuments(filter);
-    
-    // Get summary statistics for the filtered customers
-    const stats = await Customer.aggregate([
-      { $match: filter },
-      {
-        $group: {
-          _id: null,
-          totalCustomers: { $sum: 1 },
-          totalRevenue: { $sum: "$totalSpent" },
-          averageSpent: { $avg: "$totalSpent" },
-          customersWithPurchases: { 
-            $sum: { $cond: [{ $gt: ["$totalPurchases", 0] }, 1, 0] } 
-          }
-        }
-      }
+
+    const [customers, total, stats] = await Promise.all([
+      Customer.find(filter)
+        .sort({ lastPurchaseDate: -1 })
+        .limit(limit * 1)
+        .skip((page - 1) * limit)
+        .lean(),
+      Customer.countDocuments(filter),
+      Customer.aggregate([
+        { $match: filter },
+        {
+          $group: {
+            _id: null,
+            totalCustomers: { $sum: 1 },
+            totalRevenue: { $sum: "$totalSpent" },
+            averageSpent: { $avg: "$totalSpent" },
+          },
+        },
+      ]),
     ]);
-    
+
     res.json({
       customers,
       totalPages: Math.ceil(total / limit),
-      currentPage: page,
+      currentPage: Number(page),
       total,
-      stats: stats[0] || {
-        totalCustomers: 0,
-        totalRevenue: 0,
-        averageSpent: 0,
-        customersWithPurchases: 0
-      }
+      stats: stats[0] || { totalCustomers: 0, totalRevenue: 0, averageSpent: 0 },
     });
   } catch (error) {
     console.error("Error fetching customers:", error);
@@ -114,59 +214,42 @@ router.get("/", async (req, res) => {
   }
 });
 
-// GET /api/customers/all - Get ALL customers without pagination (for export/overview)
+// GET /api/customers/all — full list without pagination (used by CompanyReport, exports)
 router.get("/all", async (req, res) => {
   try {
-    const { search, sortBy = 'totalSpent', sortOrder = 'desc' } = req.query;
-    
-    // Build filter
+    const { search, sortBy = "totalSpent", sortOrder = "desc" } = req.query;
+
     const filter = {};
     if (search) {
       filter.$or = [
         { name: { $regex: search, $options: "i" } },
         { phone: { $regex: search, $options: "i" } },
-        { email: { $regex: search, $options: "i" } }
+        { email: { $regex: search, $options: "i" } },
       ];
     }
-    
-    // Build sort object
+
     const sort = {};
-    sort[sortBy] = sortOrder === 'desc' ? -1 : 1;
-    
-    const customers = await Customer.find(filter)
-      .sort(sort)
-      .lean(); // Use lean() for better performance
-    
-    // Get comprehensive statistics
-    const stats = await Customer.aggregate([
-      {
-        $group: {
-          _id: null,
-          totalCustomers: { $sum: 1 },
-          totalRevenue: { $sum: "$totalSpent" },
-          averageSpent: { $avg: "$totalSpent" },
-          maxSpent: { $max: "$totalSpent" },
-          minSpent: { $min: "$totalSpent" },
-          totalPurchases: { $sum: "$totalPurchases" },
-          customersWithPurchases: { 
-            $sum: { $cond: [{ $gt: ["$totalPurchases", 0] }, 1, 0] } 
-          }
-        }
-      }
+    sort[sortBy] = sortOrder === "desc" ? -1 : 1;
+
+    const [customers, stats] = await Promise.all([
+      Customer.find(filter).sort(sort).lean(),
+      Customer.aggregate([
+        {
+          $group: {
+            _id: null,
+            totalCustomers: { $sum: 1 },
+            totalRevenue: { $sum: "$totalSpent" },
+            averageSpent: { $avg: "$totalSpent" },
+            totalPurchases: { $sum: "$totalPurchases" },
+          },
+        },
+      ]),
     ]);
-    
+
     res.json({
       customers,
       total: customers.length,
-      stats: stats[0] || {
-        totalCustomers: 0,
-        totalRevenue: 0,
-        averageSpent: 0,
-        maxSpent: 0,
-        minSpent: 0,
-        totalPurchases: 0,
-        customersWithPurchases: 0
-      }
+      stats: stats[0] || { totalCustomers: 0, totalRevenue: 0, averageSpent: 0, totalPurchases: 0 },
     });
   } catch (error) {
     console.error("Error fetching all customers:", error);
@@ -174,136 +257,13 @@ router.get("/all", async (req, res) => {
   }
 });
 
-// GET /api/customers/timeframe/:period - Get customers by specific time period
-router.get("/timeframe/:period", async (req, res) => {
-  try {
-    const { period } = req.params;
-    const { page = 1, limit = 50 } = req.query;
-    
-    const now = new Date();
-    let startDate;
-    let periodName;
-    
-    switch(period) {
-      case 'today':
-        startDate = new Date(now.setHours(0, 0, 0, 0));
-        periodName = "Today";
-        break;
-      case 'yesterday':
-        startDate = new Date(now.setDate(now.getDate() - 1));
-        startDate.setHours(0, 0, 0, 0);
-        periodName = "Yesterday";
-        break;
-      case 'this-week':
-        startDate = new Date(now.setDate(now.getDate() - now.getDay()));
-        startDate.setHours(0, 0, 0, 0);
-        periodName = "This Week";
-        break;
-      case 'last-week':
-        startDate = new Date(now.setDate(now.getDate() - now.getDay() - 7));
-        startDate.setHours(0, 0, 0, 0);
-        periodName = "Last Week";
-        break;
-      case 'this-month':
-        startDate = new Date(now.getFullYear(), now.getMonth(), 1);
-        periodName = "This Month";
-        break;
-      case 'last-month':
-        startDate = new Date(now.getFullYear(), now.getMonth() - 1, 1);
-        periodName = "Last Month";
-        break;
-      case 'this-year':
-        startDate = new Date(now.getFullYear(), 0, 1);
-        periodName = "This Year";
-        break;
-      default:
-        return res.status(400).json({ error: "Invalid time period" });
-    }
-    
-    const filter = {
-      lastPurchaseDate: { $gte: startDate }
-    };
-    
-    const customers = await Customer.find(filter)
-      .sort({ lastPurchaseDate: -1, totalSpent: -1 })
-      .limit(limit * 1)
-      .skip((page - 1) * limit);
-    
-    const total = await Customer.countDocuments(filter);
-    
-    // Get sales data for this period
-    const salesData = await Sale.aggregate([
-      {
-        $match: {
-          createdAt: { $gte: startDate },
-          status: { $nin: ["voided", "corrected"] }
-        }
-      },
-      {
-        $group: {
-          _id: null,
-          totalSales: { $sum: 1 },
-          totalRevenue: { $sum: "$total" },
-          averageSale: { $avg: "$total" }
-        }
-      }
-    ]);
-    
-    res.json({
-      period: periodName,
-      startDate,
-      endDate: new Date(),
-      customers,
-      total,
-      totalPages: Math.ceil(total / limit),
-      currentPage: page,
-      salesSummary: salesData[0] || { totalSales: 0, totalRevenue: 0, averageSale: 0 }
-    });
-  } catch (error) {
-    console.error("Error fetching customers by timeframe:", error);
-    res.status(500).json({ error: "Failed to fetch customers by timeframe" });
-  }
-});
-
-// GET /api/customers/:id - Get a single customer by ID
-router.get("/:id", async (req, res) => {
-  try {
-    const customer = await Customer.findById(req.params.id);
-    
-    if (!customer) {
-      return res.status(404).json({ error: "Customer not found" });
-    }
-    
-    // Get customer's purchase history
-    const purchaseHistory = await Sale.find({ 
-      customerId: req.params.id,
-      status: { $nin: ["voided", "corrected"] }
-    }).sort({ createdAt: -1 });
-    
-    res.json({
-      ...customer.toObject(),
-      purchaseHistory
-    });
-  } catch (error) {
-    console.error("Error fetching customer:", error);
-    
-    if (error.name === "CastError") {
-      return res.status(400).json({ error: "Invalid customer ID" });
-    }
-    
-    res.status(500).json({ error: "Failed to fetch customer" });
-  }
-});
-
-// GET /api/customers/phone/:phone - Get customer by phone number
+// GET /api/customers/phone/:phone — lookup by phone (used in NewSale auto-fill)
 router.get("/phone/:phone", async (req, res) => {
   try {
-    const customer = await Customer.findOne({ phone: req.params.phone });
-    
+    const customer = await Customer.findOne({ phone: req.params.phone }).lean();
     if (!customer) {
       return res.status(404).json({ error: "Customer not found" });
     }
-    
     res.json(customer);
   } catch (error) {
     console.error("Error fetching customer by phone:", error);
@@ -311,174 +271,91 @@ router.get("/phone/:phone", async (req, res) => {
   }
 });
 
-// POST /api/customers/:id/recalculate - Recalculate customer statistics
-router.post("/:id/recalculate", async (req, res) => {
+// GET /api/customers/:id — single customer with purchase history
+router.get("/:id", async (req, res) => {
   try {
-    const customerId = req.params.id;
-    
-    // Get all completed sales for this customer
-    const sales = await Sale.find({ 
-      customerId: customerId,
-      status: { $nin: ["voided", "corrected"] }
-    }).sort({ createdAt: 1 });
-    
-    if (sales.length === 0) {
-      // If no valid sales, reset the customer stats
-      const updatedCustomer = await Customer.findByIdAndUpdate(
-        customerId,
-        {
-          totalPurchases: 0,
-          totalSpent: 0,
-          firstPurchaseDate: null,
-          lastPurchaseDate: null,
-        },
-        { new: true }
-      );
-      
-      return res.json(updatedCustomer);
-    }
-    
-    // Recalculate totals from VALID sales only
-    const totalPurchases = sales.length;
-    const totalSpent = sales.reduce((sum, sale) => sum + sale.total, 0);
-    const firstPurchaseDate = sales[0].createdAt;
-    const lastPurchaseDate = sales[sales.length - 1].createdAt;
+    const [customer, purchaseHistory] = await Promise.all([
+      Customer.findById(req.params.id).lean(),
+      Sale.find({
+        customerId: req.params.id,
+        status: { $nin: ["voided", "corrected"] },
+      })
+        .sort({ createdAt: -1 })
+        .lean(),
+    ]);
 
-    // Update customer
-    const updatedCustomer = await Customer.findByIdAndUpdate(
-      customerId,
-      {
-        totalPurchases,
-        totalSpent,
-        firstPurchaseDate,
-        lastPurchaseDate,
-      },
-      { new: true }
-    );
-
-    if (!updatedCustomer) {
+    if (!customer) {
       return res.status(404).json({ error: "Customer not found" });
     }
 
-    res.json(updatedCustomer);
+    res.json({ ...customer, purchaseHistory });
   } catch (error) {
-    console.error("Error recalculating customer stats:", error);
-    
+    console.error("Error fetching customer:", error);
     if (error.name === "CastError") {
       return res.status(400).json({ error: "Invalid customer ID" });
     }
-    
-    res.status(500).json({ error: "Failed to recalculate customer statistics" });
+    res.status(500).json({ error: "Failed to fetch customer" });
   }
 });
 
-// PUT /api/customers/:id - Update a customer
+// PUT /api/customers/:id — update customer info
 router.put("/:id", async (req, res) => {
   try {
     const { name, email, phone, address, notes } = req.body;
-    
+
     const updateData = {};
     if (name !== undefined) updateData.name = name;
     if (email !== undefined) updateData.email = email;
     if (phone !== undefined) updateData.phone = phone;
     if (address !== undefined) updateData.address = address;
     if (notes !== undefined) updateData.notes = notes;
-    
+
     const customer = await Customer.findByIdAndUpdate(
       req.params.id,
       updateData,
       { new: true, runValidators: true }
     );
-    
+
     if (!customer) {
       return res.status(404).json({ error: "Customer not found" });
     }
-    
+
     res.json(customer);
   } catch (error) {
     console.error("Error updating customer:", error);
-    
     if (error.name === "CastError") {
       return res.status(400).json({ error: "Invalid customer ID" });
     }
-    
     if (error.name === "ValidationError") {
-      const errors = Object.values(error.errors).map(e => e.message);
+      const errors = Object.values(error.errors).map((e) => e.message);
       return res.status(400).json({ error: errors.join(", ") });
     }
-    
     res.status(500).json({ error: "Failed to update customer" });
   }
 });
 
-// DELETE /api/customers/:id - Delete a customer
+// DELETE /api/customers/:id — only if no sales exist
 router.delete("/:id", async (req, res) => {
   try {
-    // Check if customer has any sales
     const hasSales = await Sale.exists({ customerId: req.params.id });
-    
     if (hasSales) {
-      return res.status(400).json({ 
-        error: "Cannot delete customer with existing sales. Consider archiving instead." 
+      return res.status(400).json({
+        error: "Cannot delete customer with existing sales.",
       });
     }
-    
+
     const customer = await Customer.findByIdAndDelete(req.params.id);
-    
     if (!customer) {
       return res.status(404).json({ error: "Customer not found" });
     }
-    
+
     res.json({ message: "Customer deleted successfully", customer });
   } catch (error) {
     console.error("Error deleting customer:", error);
-    
     if (error.name === "CastError") {
       return res.status(400).json({ error: "Invalid customer ID" });
     }
-    
     res.status(500).json({ error: "Failed to delete customer" });
-  }
-});
-
-// GET /api/customers/stats/top - Get top customers by spending
-router.get("/stats/top", async (req, res) => {
-  try {
-    const { limit = 10, timeFrame } = req.query;
-    
-    let filter = {};
-    
-    // Apply time frame filter if specified
-    if (timeFrame && timeFrame !== 'all') {
-      const now = new Date();
-      let dateFilter = {};
-      
-      switch(timeFrame) {
-        case 'today':
-          dateFilter = { $gte: new Date(now.setHours(0, 0, 0, 0)) };
-          break;
-        case 'week':
-          dateFilter = { $gte: new Date(now.setDate(now.getDate() - 7)) };
-          break;
-        case 'month':
-          dateFilter = { $gte: new Date(now.setMonth(now.getMonth() - 1)) };
-          break;
-        case 'year':
-          dateFilter = { $gte: new Date(now.setFullYear(now.getFullYear() - 1)) };
-          break;
-      }
-      
-      filter.lastPurchaseDate = dateFilter;
-    }
-    
-    const topCustomers = await Customer.find(filter)
-      .sort({ totalSpent: -1 })
-      .limit(parseInt(limit));
-    
-    res.json(topCustomers);
-  } catch (error) {
-    console.error("Error fetching top customers:", error);
-    res.status(500).json({ error: "Failed to fetch top customers" });
   }
 });
 

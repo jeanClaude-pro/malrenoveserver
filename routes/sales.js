@@ -5,6 +5,7 @@ const mongoose = require("mongoose");
 const Sale = require("../models/Sale");
 const Customer = require("../models/Customer");
 const Product = require("../models/Product");
+const ExchangeRate = require("../models/ExchangeRate");
 const authMiddleware = require("../middleware/auth");
 
 // normalize to the Sale model enum
@@ -511,15 +512,19 @@ router.get("/stats/daily", authMiddleware, async (req, res) => {
 /** ---------- CREATE SALE OR EXPENSE ---------- **/
 router.post("/", authMiddleware, async (req, res) => {
   try {
-    const { 
-      customer, 
-      items, 
-      paymentMethod, 
-      salesPerson, 
-      type, 
-      reservationDate, 
-      reservationTime, 
+    const {
+      customer,
+      items,
+      paymentMethod,
+      salesPerson,
+      type,
+      reservationDate,
+      reservationTime,
       notes,
+      // CREDIT FIELDS
+      paymentType,
+      creditAmountPaid,
+      creditDueDate,
       // 🔹 NEW EXPENSE FIELDS
       reason,
       recipientName,
@@ -580,10 +585,13 @@ router.post("/", authMiddleware, async (req, res) => {
     }
 
     // 🔹 HANDLE REGULAR SALE (existing logic)
-    if (!customer || !customer.name || !customer.phone) {
-      return res
-        .status(400)
-        .json({ error: "Customer name and phone are required" });
+    // Credit sales require customer identification; normal sales have optional customer info
+    if (paymentType === "credit") {
+      if (!customer || !customer.name || !customer.phone) {
+        return res
+          .status(400)
+          .json({ error: "Customer name and phone are required for credit sales" });
+      }
     }
     if (!items || !Array.isArray(items) || items.length === 0) {
       return res
@@ -677,29 +685,70 @@ router.post("/", authMiddleware, async (req, res) => {
 
     const saleNumber = `SN-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
 
-    // FIX: Get customer ID from updateCustomerData and set customerId
-    const customerId = await updateCustomerData(customer, total);
+    // Capture the active exchange rate at the moment of sale (frozen for historical accuracy)
+    const rateRecord = await ExchangeRate.getCurrentRate();
+    const capturedRate = rateRecord ? rateRecord.rate : null;
+
+    // Create/update customer only when phone is provided
+    const customerId = customer?.phone
+      ? await updateCustomerData(customer, total)
+      : null;
+
+    // Build credit details if this is a credit sale
+    const isCreditSale = paymentType === "credit";
+    let creditDetailsData = undefined;
+
+    if (isCreditSale) {
+      const initialPaid = Math.max(0, parseFloat(creditAmountPaid) || 0);
+      if (initialPaid > total + 0.001) {
+        return res.status(400).json({
+          error: "Le montant versé ne peut pas dépasser le total de la vente",
+        });
+      }
+      const amountDue = Math.max(0, total - initialPaid);
+      creditDetailsData = {
+        amountPaid: initialPaid,
+        amountDue,
+        dueDate: creditDueDate ? new Date(creditDueDate) : null,
+        fullyPaid: amountDue < 0.01,
+        payments:
+          initialPaid > 0
+            ? [
+                {
+                  amount: initialPaid,
+                  date: new Date(),
+                  method: normalizedPM,
+                  recordedBy: salesPerson || "Admin",
+                  notes: "Versement initial",
+                },
+              ]
+            : [],
+      };
+    }
 
     // UPDATED: Include type and reservation fields WITH CORRECT STATUS
     const saleData = {
       saleId,
       saleNumber,
       customer: {
-        name: customer.name,
-        phone: customer.phone,
-        email: customer.email || "",
+        name: customer?.name || "",
+        phone: customer?.phone || "",
+        email: customer?.email || "",
       },
       customerId: customerId,
       items: enrichedItems,
       subtotal,
       total,
       paymentMethod: normalizedPM,
-      status: type === "reservation" ? "pending" : "completed", // ✅ FIXED: Reservations as pending (money received)
+      paymentType: isCreditSale ? "credit" : "cash",
+      ...(creditDetailsData && { creditDetails: creditDetailsData }),
+      status: type === "reservation" ? "pending" : "completed",
       salesPerson: salesPerson || "Admin",
       type: type || "sale",
       reservationDate: reservationDate || null,
       reservationTime: reservationTime || null,
-      notes: notes || ""
+      notes: notes || "",
+      exchangeRate: capturedRate,
     };
 
     for (const it of enrichedItems) {
@@ -1265,6 +1314,73 @@ router.patch("/:id/pending", authMiddleware, async (req, res) => {
   } catch (error) {
     console.error("Error setting reservation to pending:", error);
     res.status(500).json({ error: "Échec de la mise à jour de la réservation" });
+  }
+});
+
+/** ---------- RECORD CREDIT PAYMENT ---------- **/
+router.patch("/:id/credit-payment", authMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { amount, method, notes } = req.body;
+
+    const paymentAmount = parseFloat(amount);
+    if (!Number.isFinite(paymentAmount) || paymentAmount <= 0) {
+      return res.status(400).json({ error: "Le montant du paiement doit être supérieur à zéro" });
+    }
+
+    const normalizedMethod = normalizePaymentMethod(method || "cash");
+
+    const sale = await Sale.findById(id).lean();
+    if (!sale) {
+      return res.status(404).json({ error: "Vente non trouvée" });
+    }
+
+    if (sale.paymentType !== "credit") {
+      return res.status(400).json({ error: "Cette vente n'est pas une vente à crédit" });
+    }
+
+    if (sale.status === "voided") {
+      return res.status(400).json({ error: "Impossible d'enregistrer un paiement sur une vente annulée" });
+    }
+
+    const currentAmountDue = sale.creditDetails?.amountDue ?? 0;
+    if (paymentAmount > currentAmountDue + 0.001) {
+      return res.status(400).json({
+        error: `Le montant dépasse le solde dû (${currentAmountDue.toFixed(2)} USD)`,
+      });
+    }
+
+    const newAmountPaid = (sale.creditDetails?.amountPaid ?? 0) + paymentAmount;
+    const newAmountDue = Math.max(0, (sale.creditDetails?.amountDue ?? sale.total) - paymentAmount);
+    const fullyPaid = newAmountDue < 0.01;
+
+    const updatedSale = await Sale.findByIdAndUpdate(
+      id,
+      {
+        "creditDetails.amountPaid": newAmountPaid,
+        "creditDetails.amountDue": newAmountDue,
+        "creditDetails.fullyPaid": fullyPaid,
+        $push: {
+          "creditDetails.payments": {
+            amount: paymentAmount,
+            date: new Date(),
+            method: normalizedMethod,
+            recordedBy: req.user.username || req.user.userId,
+            notes: notes || "",
+          },
+        },
+      },
+      { new: true, runValidators: true }
+    );
+
+    res.json({
+      success: true,
+      message: fullyPaid ? "Crédit soldé avec succès!" : "Paiement enregistré avec succès",
+      sale: updatedSale,
+    });
+  } catch (error) {
+    console.error("Error recording credit payment:", error);
+    res.status(500).json({ error: "Échec de l'enregistrement du paiement" });
   }
 });
 

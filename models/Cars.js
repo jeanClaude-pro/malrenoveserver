@@ -58,7 +58,7 @@ const carTripSchema = new mongoose.Schema(
       productId: {
         type: mongoose.Schema.Types.ObjectId,
         ref: "Product",
-        required: true,
+        default: null,
       },
       productName: {
         type: String,
@@ -94,11 +94,20 @@ const carTripSchema = new mongoose.Schema(
     },
     expectedArrivalTime: {
       type: Date,
-      required: true,
+      default: null,
     },
     actualArrivalTime: {
       type: Date,
       default: null,
+    },
+    // Arrival confirmation details (filled when car marks as arrived)
+    arrivalDetails: {
+      confirmedAt: { type: Date, default: null },
+      confirmedBy: { type: String, default: "" },
+      receivedBoxes: { type: Number, min: 0, default: 0 },
+      receivedPieces: { type: Number, min: 0, default: 0 },
+      totalReceivedPieces: { type: Number, min: 0, default: 0 },
+      notes: { type: String, trim: true, maxlength: 1000, default: "" },
     },
     status: {
       type: String,

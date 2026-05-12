@@ -180,6 +180,45 @@ const saleSchema = new mongoose.Schema(
       type: String,
       default: null,
     },
+    // --- CREDIT SALE FIELDS ---
+    paymentType: {
+      type: String,
+      enum: ["cash", "credit"],
+      default: "cash",
+    },
+    creditDetails: {
+      amountPaid: {
+        type: Number,
+        default: 0,
+        min: 0,
+      },
+      amountDue: {
+        type: Number,
+        default: 0,
+        min: 0,
+      },
+      dueDate: {
+        type: Date,
+        default: null,
+      },
+      fullyPaid: {
+        type: Boolean,
+        default: false,
+      },
+      payments: [
+        {
+          amount: { type: Number, required: true, min: 0.01 },
+          date: { type: Date, default: Date.now },
+          method: {
+            type: String,
+            enum: ["cash", "card", "transfer", "other"],
+            default: "cash",
+          },
+          recordedBy: { type: String, default: "Admin" },
+          notes: { type: String, default: "" },
+        },
+      ],
+    },
     // --- EXISTING FIELDS ---
     voidedBy: {
       type: mongoose.Schema.Types.ObjectId,
@@ -227,6 +266,12 @@ const saleSchema = new mongoose.Schema(
         reason: String,
       },
     ],
+    // Rate (FC per 1 USD) active at the moment of this sale — frozen for accurate historical reports
+    exchangeRate: {
+      type: Number,
+      default: null,
+      min: 0,
+    },
   },
   {
     timestamps: true,
@@ -235,6 +280,8 @@ const saleSchema = new mongoose.Schema(
 
 // Create index for better query performance
 saleSchema.index({ createdAt: -1 });
+saleSchema.index({ paymentType: 1 });
+saleSchema.index({ "creditDetails.fullyPaid": 1 });
 saleSchema.index({ "customer.phone": 1 }); // Keep this explicit index
 // REMOVED: saleSchema.index({ saleId: 1 }); ← DUPLICATE of unique: true on saleId
 saleSchema.index({ salesPerson: 1 });
