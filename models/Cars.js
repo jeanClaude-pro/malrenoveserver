@@ -199,7 +199,7 @@ carTripSchema.pre("save", async function () {
 });
 
 // Indexes for better query performance
-carTripSchema.index({ tripId: 1 });
+// NOTE: tripId already has a unique index from `unique: true` above — no need to redeclare it
 carTripSchema.index({ status: 1 });
 carTripSchema.index({ departureTime: -1 });
 carTripSchema.index({ "driver.phone": 1 });

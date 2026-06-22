@@ -3,7 +3,6 @@ const express = require("express");
 const mongoose = require("mongoose");
 const cors = require("cors");
 const morgan = require("morgan");
-const path = require("path");
 
 const app = express();
 
@@ -161,18 +160,19 @@ app.get("/health", (req, res) => {
   });
 });
 
-// Serve React frontend in production
-const clientDistPath = path.join(__dirname, '..', 'client', 'dist');
-app.use(express.static(clientDistPath));
+// API-only service — frontend is deployed separately (Netlify)
+app.get('/', (req, res) => {
+  res.json({ message: 'Dookon API is running', health: '/health' });
+});
 
 // 404 for unknown API routes
 app.use('/api', (req, res) => {
   res.status(404).json({ message: `Route ${req.method} ${req.path} not found` });
 });
 
-// SPA fallback — all non-API routes return index.html
+// 404 for everything else
 app.use((req, res) => {
-  res.sendFile(path.join(clientDistPath, 'index.html'));
+  res.status(404).json({ message: `Route ${req.method} ${req.path} not found` });
 });
 
 // Error handling middleware
