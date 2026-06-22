@@ -454,6 +454,37 @@ router.get("/", authMiddleware, async (req, res) => {
   }
 });
 
+/** ---------- ALL OUTSTANDING CREDIT SALES (not restricted by sale date) ---------- **/
+router.get("/unpaid", authMiddleware, async (req, res) => {
+  try {
+    const sales = await Sale.find({
+      paymentType: "credit",
+      "creditDetails.fullyPaid": false,
+      "creditDetails.amountDue": { $gt: 0 },
+      status: { $nin: ["voided", "corrected", "refunded"] },
+      type: { $in: ["sale", "reservation"] },
+    })
+      .select("-__v")
+      .sort({ "creditDetails.dueDate": 1, createdAt: 1 })
+      .lean();
+
+    res.json({
+      success: true,
+      data: sales,
+      summary: {
+        totalRecords: sales.length,
+        totalOutstanding: sales.reduce(
+          (sum, sale) => sum + Number(sale.creditDetails?.amountDue || 0),
+          0
+        ),
+      },
+    });
+  } catch (error) {
+    console.error("Error fetching unpaid credit sales:", error);
+    res.status(500).json({ error: "Failed to fetch unpaid credit sales" });
+  }
+});
+
 // ==================== ALL OTHER ROUTES REMAIN UNCHANGED ====================
 
 /** ---------- DAILY STATS FIRST (before :id) ---------- **/
