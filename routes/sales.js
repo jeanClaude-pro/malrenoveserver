@@ -561,10 +561,33 @@ router.post("/", authMiddleware, async (req, res) => {
       recipientName,
       recipientPhone,
       amount,
-      recordedBy
+      recordedBy,
+      // 🔹 Admin-only: backdate/forward-date which calendar day this sale belongs to
+      saleDate,
     } = req.body;
 
     const normalizedPM = normalizePaymentMethod(paymentMethod);
+
+    // Only admins may pick a different day for the sale to be recorded under.
+    // Mongoose's `timestamps: true` only auto-fills `createdAt` when it isn't
+    // already set, so assigning it here makes the sale appear/be calculated
+    // under that date everywhere createdAt is used for filtering (SalesHistory,
+    // CompanyReport, etc.) — the time-of-day is kept as "now" so ordering within
+    // the day stays chronological.
+    let customCreatedAt = null;
+    if (saleDate && req.user?.role === "admin") {
+      const datePart = String(saleDate).slice(0, 10);
+      const now = new Date();
+      const timeOfDay = [
+        String(now.getHours()).padStart(2, "0"),
+        String(now.getMinutes()).padStart(2, "0"),
+        String(now.getSeconds()).padStart(2, "0"),
+      ].join(":");
+      const candidate = new Date(`${datePart}T${timeOfDay}`);
+      if (!Number.isNaN(candidate.getTime())) {
+        customCreatedAt = candidate;
+      }
+    }
 
     // 🔹 HANDLE EXPENSE TYPE
     if (type === "expense") {
@@ -780,6 +803,7 @@ router.post("/", authMiddleware, async (req, res) => {
       reservationTime: reservationTime || null,
       notes: notes || "",
       exchangeRate: capturedRate,
+      ...(customCreatedAt && { createdAt: customCreatedAt }),
     };
 
     for (const it of enrichedItems) {

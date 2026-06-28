@@ -129,7 +129,8 @@ const routes = [
   { path: "/api/loan", name: "loan", file: "./routes/loan" },
   { path: "/api/cars", name: "cars", file: "./routes/cars" },
   { path: "/api/car-trips", name: "cars", file: "./routes/cars"},
-  { path: "/api/stock-movements", name: "stockMovements", file: "./routes/stockMovements" }
+  { path: "/api/stock-movements", name: "stockMovements", file: "./routes/stockMovements" },
+  { path: "/api/transfers", name: "transfers", file: "./routes/transfers" }
 ];
 
 // Load each route
