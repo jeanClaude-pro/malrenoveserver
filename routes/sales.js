@@ -1211,76 +1211,73 @@ router.put("/:id", authMiddleware, async (req, res) => {
       }
     }
 
-    // Apply stock adjustments
-    const appliedStockAdjustments = [];
-    for (const adjustment of stockAdjustments) {
-      const updatedProduct = await Product.findByIdAndUpdate(
-        { _id: adjustment.productId, stock: { $gte: Math.max(0, -adjustment.adjustment) } },
-        { $inc: { stock: adjustment.adjustment } },
-        { new: true }
-      );
-      
-      if (!updatedProduct) {
-        // Rollback previous adjustments if any fail
-        for (const rollbackAdj of appliedStockAdjustments.reverse()) {
-          await Product.findByIdAndUpdate(
-            rollbackAdj.productId,
-            { $inc: { stock: -rollbackAdj.adjustment } }
-          );
-        }
-        return res.status(400).json({ 
-          error: `Insufficient stock for product update` 
-        });
-      }
-      appliedStockAdjustments.push(adjustment);
-    }
-
     // Track what changed
     if (JSON.stringify(originalSale.customer) !== JSON.stringify(customer)) {
       changes.set('customer', { from: originalSale.customer, to: customer });
     }
-    
     if (originalSale.total !== total) {
       changes.set('total', { from: originalSale.total, to: total });
     }
-    
     if (originalSale.paymentMethod !== normalizedPM) {
       changes.set('paymentMethod', { from: originalSale.paymentMethod, to: normalizedPM });
     }
-
-    // Track type changes
     if (originalSale.type !== type) {
       changes.set('type', { from: originalSale.type, to: type });
     }
 
-    // Update the sale
-    const updatedSale = await Sale.findByIdAndUpdate(
-      id,
-      {
-        customer,
-        items: enrichedItems,
-        subtotal,
-        total,
-        paymentMethod: normalizedPM,
-        type: type || originalSale.type,
-        reservationDate: reservationDate || originalSale.reservationDate,
-        reservationTime: reservationTime || originalSale.reservationTime,
-        notes: notes || originalSale.notes,
-        editedBy: req.user.userId,
-        editedAt: new Date(),
-        $push: {
-          editHistory: {
-            editedBy: req.user.userId,
-            editedAt: new Date(),
-            changes: Object.fromEntries(changes),
-            reason: reason || "Sale correction"
-          }
-        }
-      },
-      { new: true, runValidators: true }
-    );
+    // Apply stock adjustments + sale update atomically in a single transaction
+    const session = await mongoose.startSession();
+    let updatedSale;
+    try {
+      session.startTransaction();
 
-    // FIX: Use recalculateCustomerStats instead of updateCustomerData
+      for (const adjustment of stockAdjustments) {
+        const updatedProduct = await Product.findOneAndUpdate(
+          { _id: adjustment.productId, stock: { $gte: Math.max(0, -adjustment.adjustment) } },
+          { $inc: { stock: adjustment.adjustment } },
+          { new: true, session }
+        );
+        if (!updatedProduct) {
+          await session.abortTransaction();
+          await session.endSession();
+          return res.status(400).json({ error: "Insufficient stock for product update" });
+        }
+      }
+
+      updatedSale = await Sale.findByIdAndUpdate(
+        id,
+        {
+          customer,
+          items: enrichedItems,
+          subtotal,
+          total,
+          paymentMethod: normalizedPM,
+          type: type || originalSale.type,
+          reservationDate: reservationDate || originalSale.reservationDate,
+          reservationTime: reservationTime || originalSale.reservationTime,
+          notes: notes || originalSale.notes,
+          editedBy: req.user.userId,
+          editedAt: new Date(),
+          $push: {
+            editHistory: {
+              editedBy: req.user.userId,
+              editedAt: new Date(),
+              changes: Object.fromEntries(changes),
+              reason: reason || "Sale correction"
+            }
+          }
+        },
+        { new: true, runValidators: true, session }
+      );
+
+      await session.commitTransaction();
+    } catch (txError) {
+      await session.abortTransaction();
+      throw txError;
+    } finally {
+      await session.endSession();
+    }
+
     if (changes.has('customer') || changes.has('total')) {
       await recalculateCustomerStats(originalSale.customerId);
     }
@@ -1458,36 +1455,48 @@ router.patch("/:id/void", authMiddleware, async (req, res) => {
       return res.status(400).json({ error: "Sale is already voided" });
     }
 
-    // Return stock to inventory (only for sales and reservations with items)
-    // ✅ FIXED: Check for reservation type as well
-    if ((sale.type === "sale" || sale.type === "reservation") && sale.items && sale.items.length > 0) {
-      for (const item of sale.items) {
-        await Product.findByIdAndUpdate(
-          item.productId,
-          { $inc: { stock: item.quantity } }
-        );
+    // Return stock + void sale atomically in a single transaction
+    const session = await mongoose.startSession();
+    let voidedSale;
+    try {
+      session.startTransaction();
+
+      if ((sale.type === "sale" || sale.type === "reservation") && sale.items && sale.items.length > 0) {
+        for (const item of sale.items) {
+          await Product.findByIdAndUpdate(
+            item.productId,
+            { $inc: { stock: item.quantity } },
+            { session }
+          );
+        }
       }
+
+      voidedSale = await Sale.findByIdAndUpdate(
+        id,
+        {
+          status: "voided",
+          voidedBy: req.user.userId,
+          voidedAt: new Date(),
+          $push: {
+            editHistory: {
+              editedBy: req.user.userId,
+              editedAt: new Date(),
+              changes: { status: { from: sale.status, to: "voided" } },
+              reason: reason || "Sale voided"
+            }
+          }
+        },
+        { new: true, session }
+      );
+
+      await session.commitTransaction();
+    } catch (txError) {
+      await session.abortTransaction();
+      throw txError;
+    } finally {
+      await session.endSession();
     }
 
-    const voidedSale = await Sale.findByIdAndUpdate(
-      id,
-      {
-        status: "voided",
-        voidedBy: req.user.userId,
-        voidedAt: new Date(),
-        $push: {
-          editHistory: {
-            editedBy: req.user.userId,
-            editedAt: new Date(),
-            changes: { status: { from: sale.status, to: "voided" } },
-            reason: reason || "Sale voided"
-          }
-        }
-      },
-      { new: true }
-    );
-
-    // FIX: Recalculate customer stats after voiding (only for sales and reservations)
     if (sale.customerId && (sale.type === "sale" || sale.type === "reservation")) {
       await recalculateCustomerStats(sale.customerId);
     }
@@ -1516,62 +1525,48 @@ router.delete("/:id", authMiddleware, async (req, res) => {
     }
 
     const customerId = sale.customerId;
-    
-    // ✅ FIXED: RETURN STOCK TO INVENTORY WHEN DELETING RESERVATIONS OR SALES
-    // Only return stock if the sale wasn't already voided (to avoid double return)
-    if ((sale.type === "reservation" || sale.type === "sale") && 
-        sale.items && sale.items.length > 0 && 
-        sale.status !== "voided") {
-      
-      console.log(`🔄 Returning stock for deleted ${sale.type}:`, {
-        saleId: sale._id,
-        itemsCount: sale.items.length,
-        items: sale.items.map(item => ({
-          productId: item.productId,
-          name: item.name,
-          quantity: item.quantity
-        }))
-      });
-      
-      for (const item of sale.items) {
-        try {
-          const updatedProduct = await Product.findByIdAndUpdate(
+
+    // Return stock + delete sale atomically in a single transaction
+    const session = await mongoose.startSession();
+    try {
+      session.startTransaction();
+
+      if ((sale.type === "reservation" || sale.type === "sale") &&
+          sale.items && sale.items.length > 0 &&
+          sale.status !== "voided") {
+        for (const item of sale.items) {
+          await Product.findByIdAndUpdate(
             item.productId,
             { $inc: { stock: item.quantity } },
-            { new: true }
+            { session }
           );
-          
-          if (updatedProduct) {
-            console.log(`✅ Returned ${item.quantity} units of "${item.name}", new stock: ${updatedProduct.stock}`);
-          } else {
-            console.warn(`❌ Product not found for ID: ${item.productId}`);
-          }
-        } catch (productError) {
-          console.error(`Error returning stock for product ${item.productId}:`, productError);
         }
       }
+
+      await Sale.findByIdAndDelete(req.params.id).session(session);
+
+      await session.commitTransaction();
+    } catch (txError) {
+      await session.abortTransaction();
+      throw txError;
+    } finally {
+      await session.endSession();
     }
 
-    // Delete the sale record
-    await Sale.findByIdAndDelete(req.params.id);
-
-    // Update customer statistics (only for sales and reservations, not expenses)
     if (customerId && (sale.type === "sale" || sale.type === "reservation")) {
       await recalculateCustomerStats(customerId);
     }
 
-    res.json({ 
+    res.json({
       success: true,
       message: "Sale deleted successfully",
       stockReturned: (sale.type === "reservation" || sale.type === "sale") && sale.items && sale.items.length > 0
     });
   } catch (error) {
     console.error("Error deleting sale:", error);
-    
     if (error.name === "CastError") {
       return res.status(400).json({ error: "Invalid sale ID" });
     }
-    
     res.status(500).json({ error: "Failed to delete sale" });
   }
 });

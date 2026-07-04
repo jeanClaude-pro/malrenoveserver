@@ -226,6 +226,7 @@ router.post("/", authMiddleware, async (req, res) => {
       tollCost,
       otherCosts,
       notes,
+      operationDate,
     } = req.body;
     
     // Validate required fields
@@ -286,8 +287,14 @@ router.post("/", authMiddleware, async (req, res) => {
       createdByName: req.user.name || req.user.username || "Unknown",
     });
     
+    if (operationDate && req.user.isAdmin) {
+      const opDate = new Date(operationDate + "T12:00:00");
+      if (!isNaN(opDate.getTime()) && opDate <= new Date()) {
+        trip.createdAt = opDate;
+      }
+    }
     await trip.save();
-    
+
     res.status(201).json({
       success: true,
       message: "Car trip created successfully",

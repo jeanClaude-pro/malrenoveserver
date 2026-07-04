@@ -164,6 +164,7 @@ router.post("/", authMiddleware, async (req, res) => {
       receiver,
       transport,
       notes,
+      operationDate,
     } = req.body;
 
     // Validate required fields
@@ -209,6 +210,11 @@ router.post("/", authMiddleware, async (req, res) => {
 
     let transfer;
     try {
+      let customCreatedAt = null;
+      if (operationDate && req.user.isAdmin) {
+        const opDate = new Date(operationDate + "T12:00:00");
+        if (!isNaN(opDate.getTime()) && opDate <= new Date()) customCreatedAt = opDate;
+      }
       transfer = new Transfer({
         transferId: generateTransferId(),
         product: {
@@ -236,7 +242,7 @@ router.post("/", authMiddleware, async (req, res) => {
         createdBy: req.user.userId,
         createdByName: req.user.name || req.user.username || "Unknown",
       });
-
+      if (customCreatedAt) transfer.createdAt = customCreatedAt;
       await transfer.save();
     } catch (saveError) {
       // Roll back the stock deduction since the transfer record was never created.

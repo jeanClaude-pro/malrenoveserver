@@ -567,7 +567,7 @@ router.get("/", authMiddleware, async (req, res) => {
 /** ---------- CREATE EXPENSE ---------- **/
 router.post("/", authMiddleware, async (req, res) => {
   try {
-    const { reason, recipientName, recipientPhone, amount, paymentMethod, notes, recordedBy } = req.body;
+    const { reason, recipientName, recipientPhone, amount, paymentMethod, notes, recordedBy, operationDate } = req.body;
 
     // Validation
     if (!reason || !recipientName || !recipientPhone || !amount) {
@@ -611,6 +611,12 @@ router.post("/", authMiddleware, async (req, res) => {
     };
 
     const expense = new Expense(expenseData);
+    if (operationDate && req.user.isAdmin) {
+      const opDate = new Date(operationDate + "T12:00:00");
+      if (!isNaN(opDate.getTime()) && opDate <= new Date()) {
+        expense.createdAt = opDate;
+      }
+    }
     const savedExpense = await expense.save();
 
     // Send email notification

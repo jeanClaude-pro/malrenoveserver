@@ -357,13 +357,14 @@ router.get("/", authMiddleware, async (req, res) => {
 /** ---------- CREATE ENTRY (Everyone can create) ---------- */
 router.post("/", authMiddleware, async (req, res) => {
   try {
-    const { 
-      amount, 
-      source, 
-      paymentMethod, 
-      category, 
+    const {
+      amount,
+      source,
+      paymentMethod,
+      category,
       description,
-      receivedFrom 
+      receivedFrom,
+      operationDate,
     } = req.body;
 
     // Validation (like your sale validation)
@@ -404,6 +405,12 @@ router.post("/", authMiddleware, async (req, res) => {
     };
 
     const entry = new Entry(entryData);
+    if (operationDate && req.user.isAdmin) {
+      const opDate = new Date(operationDate + "T12:00:00");
+      if (!isNaN(opDate.getTime()) && opDate <= new Date()) {
+        entry.createdAt = opDate;
+      }
+    }
     const savedEntry = await entry.save();
 
     return res.status(201).json(savedEntry);
