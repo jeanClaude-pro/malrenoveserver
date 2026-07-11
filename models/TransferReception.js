@@ -24,6 +24,11 @@ const transferReceptionSchema = new mongoose.Schema(
   {
     receptionId: { type: String, unique: true },
 
+    // Links this reception back to the Transfer it fulfills. Unique+sparse so a
+    // given transfer can only ever be received once (prevents duplicate receptions),
+    // while staying optional for legacy records created before this link existed.
+    transferId: { type: mongoose.Schema.Types.ObjectId, ref: "Transfer" },
+
     product: {
       productId: { type: mongoose.Schema.Types.ObjectId, ref: "Product", required: true },
       name: { type: String, required: true, maxlength: 120 },
@@ -35,7 +40,10 @@ const transferReceptionSchema = new mongoose.Schema(
 
     sourceLocation: { type: String, required: true, maxlength: 200 },
     transferReference: { type: String, required: true, maxlength: 100 },
-    deliveredBy: { type: String, required: true, maxlength: 100 },
+    // A direct reception may legitimately not have the deliverer's details yet.
+    // The UI treats this field as optional, so the persistence rule must do the
+    // same instead of turning a valid submission into a server error.
+    deliveredBy: { type: String, default: "", maxlength: 100 },
     receivedBy: { type: String, required: true, maxlength: 100 },
     notes: { type: String, default: "", maxlength: 500 },
 
@@ -58,14 +66,15 @@ const transferReceptionSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-transferReceptionSchema.pre("validate", function (next) {
+transferReceptionSchema.pre("validate", function () {
   if (!this.receptionId) this.receptionId = generateReceptionId();
-  next();
 });
 
 transferReceptionSchema.index({ createdAt: -1 });
 transferReceptionSchema.index({ status: 1 });
 transferReceptionSchema.index({ "product.productId": 1 });
-transferReceptionSchema.index({ receptionId: 1 });
+// receptionId already gets a unique index from its field-level `unique: true` above —
+// declaring it again here was the cause of the "Duplicate schema index" Mongoose warning.
+transferReceptionSchema.index({ transferId: 1 }, { unique: true, sparse: true });
 
 module.exports = mongoose.model("TransferReception", transferReceptionSchema);

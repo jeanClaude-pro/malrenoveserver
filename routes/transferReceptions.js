@@ -3,6 +3,7 @@ const express = require("express");
 const router = express.Router();
 const mongoose = require("mongoose");
 const TransferReception = require("../models/TransferReception");
+const Transfer = require("../models/Transfer");
 const Product = require("../models/Product");
 const authMiddleware = require("../middleware/auth");
 
@@ -104,37 +105,87 @@ router.get("/:id", authMiddleware, async (req, res) => {
   }
 });
 
-// ==================== CREATE ====================
+// ==================== CREATE (receive a pending transfer, or record a direct reception) ====================
 router.post("/", authMiddleware, async (req, res) => {
   try {
     const {
+      transferId,
       productId,
-      cartonQuantity = 0,
-      looseQuantity = 0,
       sourceLocation,
       transferReference,
+      cartonQuantity,
+      looseQuantity,
       deliveredBy,
       receivedBy,
       notes = "",
       operationDate,
     } = req.body;
 
-    if (!productId) return res.status(400).json({ error: "Product is required" });
-    if (!sourceLocation || !sourceLocation.trim())
-      return res.status(400).json({ error: "Source location is required" });
-    if (!transferReference || !transferReference.trim())
-      return res.status(400).json({ error: "Transfer reference is required" });
-    if (!deliveredBy || !deliveredBy.trim())
-      return res.status(400).json({ error: "Delivered by is required" });
     if (!receivedBy || !receivedBy.trim())
       return res.status(400).json({ error: "Received by is required" });
 
-    const product = await Product.findById(productId).lean();
-    if (!product) return res.status(404).json({ error: "Product not found" });
+    // Two ways to record a reception:
+    //  - linked to a pending Transfer (transferId given): product/source come from that transfer.
+    //  - direct (no transferId): the receiver picks the product from inventory themselves and
+    //    supplies where it came from — no prior Transfer record required.
+    let transfer = null;
+    let effectiveProductId;
+    let productName;
+    let piecesPerCarton;
+    let cartons;
+    let loose;
+    let effectiveSourceLocation;
+    let effectiveTransferReference;
+    let effectiveDeliveredBy;
 
-    const piecesPerCarton = Math.max(1, Math.floor(Number(product.piecesPerCarton || 1)));
-    const cartons = Math.max(0, Math.floor(Number(cartonQuantity)));
-    const loose = Math.max(0, Math.floor(Number(looseQuantity)));
+    if (transferId) {
+      transfer = await Transfer.findById(transferId);
+      if (!transfer) return res.status(404).json({ error: "Transfer not found" });
+
+      if (transfer.status === "cancelled") {
+        return res.status(400).json({ error: "This transfer was cancelled and cannot be received" });
+      }
+      if (transfer.status === "delivered") {
+        return res.status(409).json({ error: "This transfer has already been received" });
+      }
+
+      effectiveProductId = transfer.product?.productId;
+      if (!effectiveProductId) {
+        return res.status(400).json({ error: "This transfer has no linked inventory product and cannot be received automatically" });
+      }
+
+      piecesPerCarton = Math.max(1, Math.floor(Number(transfer.product.piecesPerCarton || 1)));
+      // Default to exactly what was sent; the receiver can override to record a discrepancy.
+      cartons = Math.max(
+        0,
+        Math.floor(Number(cartonQuantity !== undefined ? cartonQuantity : transfer.product.cartonQuantity))
+      );
+      loose = Math.max(
+        0,
+        Math.floor(Number(looseQuantity !== undefined ? looseQuantity : transfer.product.looseQuantity))
+      );
+      productName = transfer.product.name;
+      effectiveSourceLocation = transfer.sourceLocation;
+      effectiveTransferReference = transfer.transferId;
+      effectiveDeliveredBy = (deliveredBy && deliveredBy.trim()) || transfer.transport?.driverName || transfer.transport?.transportCompany || "";
+    } else {
+      if (!productId) return res.status(400).json({ error: "Please select the product being received" });
+      if (!sourceLocation || !sourceLocation.trim()) {
+        return res.status(400).json({ error: "Please indicate where this delivery came from" });
+      }
+
+      const directProduct = await Product.findById(productId).lean();
+      if (!directProduct) return res.status(404).json({ error: "Product not found" });
+
+      effectiveProductId = productId;
+      piecesPerCarton = Math.max(1, Math.floor(Number(directProduct.piecesPerCarton || 1)));
+      cartons = Math.max(0, Math.floor(Number(cartonQuantity || 0)));
+      loose = Math.max(0, Math.floor(Number(looseQuantity || 0)));
+      productName = directProduct.name;
+      effectiveSourceLocation = sourceLocation.trim();
+      effectiveTransferReference = (transferReference && transferReference.trim()) || "Réception directe";
+      effectiveDeliveredBy = (deliveredBy && deliveredBy.trim()) || "";
+    }
 
     if (loose >= piecesPerCarton) {
       return res.status(400).json({
@@ -147,8 +198,12 @@ router.post("/", authMiddleware, async (req, res) => {
       return res.status(400).json({ error: "Received quantity must be greater than zero" });
     }
 
+    const product = await Product.findById(effectiveProductId).lean();
+    if (!product) return res.status(404).json({ error: "Product not found" });
+
     const previousStock = Number(product.stock || 0);
     const newStock = previousStock + totalPieces;
+    const receivedByName = receivedBy.trim();
 
     const session = await mongoose.startSession();
     let reception;
@@ -156,29 +211,30 @@ router.post("/", authMiddleware, async (req, res) => {
       session.startTransaction();
 
       await Product.findByIdAndUpdate(
-        productId,
+        effectiveProductId,
         { $inc: { stock: totalPieces } },
         { session }
       );
 
       reception = new TransferReception({
+        transferId: transfer ? transfer._id : undefined,
         product: {
-          productId: new mongoose.Types.ObjectId(productId),
-          name: product.name,
+          productId: effectiveProductId,
+          name: productName,
           cartonQuantity: cartons,
           looseQuantity: loose,
           piecesPerCarton,
           totalPieces,
         },
-        sourceLocation: sourceLocation.trim(),
-        transferReference: transferReference.trim(),
-        deliveredBy: deliveredBy.trim(),
-        receivedBy: receivedBy.trim(),
+        sourceLocation: effectiveSourceLocation,
+        transferReference: effectiveTransferReference,
+        deliveredBy: effectiveDeliveredBy,
+        receivedBy: receivedByName,
         notes: String(notes || "").trim(),
         previousStock,
         newStock,
         recordedBy: req.user.name || req.user.username,
-        recordedByUserId: req.user._id,
+        recordedByUserId: req.user.userId || req.user._id,
       });
 
       if (operationDate && req.user.isAdmin) {
@@ -186,6 +242,24 @@ router.post("/", authMiddleware, async (req, res) => {
         if (!isNaN(opDate.getTime()) && opDate <= new Date()) reception.createdAt = opDate;
       }
       await reception.save({ session });
+
+      if (transfer) {
+        const previousTransferStatus = transfer.status;
+        transfer.status = "delivered";
+        transfer.deliveredAt = reception.createdAt || new Date();
+        transfer.deliveryConfirmedBy = receivedByName;
+        transfer.lastModifiedBy = req.user.userId;
+        transfer.lastModifiedByName = req.user.name || req.user.username || "Unknown";
+        transfer.editHistory.push({
+          modifiedBy: req.user.userId,
+          modifiedByName: req.user.name || req.user.username || "Unknown",
+          modifiedAt: new Date(),
+          changes: { status: { from: previousTransferStatus, to: "delivered" } },
+          reason: `Received via reception ${reception.receptionId}`,
+        });
+        await transfer.save({ session });
+      }
+
       await session.commitTransaction();
     } catch (txError) {
       await session.abortTransaction();
@@ -197,7 +271,14 @@ router.post("/", authMiddleware, async (req, res) => {
     res.status(201).json({ success: true, data: reception });
   } catch (error) {
     console.error("Error creating reception:", error);
-    if (error.name === "CastError") return res.status(400).json({ error: "Invalid product ID" });
+    if (error.name === "CastError") return res.status(400).json({ error: "Invalid transfer or product ID" });
+    if (error.name === "ValidationError") {
+      const errors = Object.values(error.errors).map((validationError) => validationError.message);
+      return res.status(400).json({ error: errors.join(", ") });
+    }
+    if (error.code === 11000) {
+      return res.status(409).json({ error: "This transfer has already been received" });
+    }
     res.status(500).json({ error: "Failed to create reception" });
   }
 });
@@ -264,12 +345,19 @@ router.put("/:id", authMiddleware, async (req, res) => {
       });
     }
 
+    // When a reception is linked to a real Transfer, its source location and transfer
+    // reference must keep matching that transfer's own records — only the physically
+    // counted quantity and the people involved can be corrected here.
+    const lockLocationFields = !!original.transferId;
+    const effectiveSourceLocation = lockLocationFields ? original.sourceLocation : (sourceLocation || original.sourceLocation);
+    const effectiveTransferReference = lockLocationFields ? original.transferReference : (transferReference || original.transferReference);
+
     const changes = {};
     if (newTotalPieces !== originalPieces)
       changes.totalPieces = { from: originalPieces, to: newTotalPieces };
-    if (sourceLocation && sourceLocation !== original.sourceLocation)
+    if (!lockLocationFields && sourceLocation && sourceLocation !== original.sourceLocation)
       changes.sourceLocation = { from: original.sourceLocation, to: sourceLocation };
-    if (transferReference && transferReference !== original.transferReference)
+    if (!lockLocationFields && transferReference && transferReference !== original.transferReference)
       changes.transferReference = { from: original.transferReference, to: transferReference };
     if (deliveredBy && deliveredBy !== original.deliveredBy)
       changes.deliveredBy = { from: original.deliveredBy, to: deliveredBy };
@@ -314,8 +402,8 @@ router.put("/:id", authMiddleware, async (req, res) => {
           "product.cartonQuantity": newCartons,
           "product.looseQuantity": newLoose,
           "product.totalPieces": newTotalPieces,
-          sourceLocation: (sourceLocation || original.sourceLocation).trim(),
-          transferReference: (transferReference || original.transferReference).trim(),
+          sourceLocation: effectiveSourceLocation.trim(),
+          transferReference: effectiveTransferReference.trim(),
           deliveredBy: (deliveredBy || original.deliveredBy).trim(),
           receivedBy: (receivedBy || original.receivedBy).trim(),
           notes: notes !== undefined ? String(notes).trim() : original.notes,
@@ -404,6 +492,29 @@ router.patch("/:id/void", authMiddleware, async (req, res) => {
         { new: true, session }
       );
 
+      // The transfer this reception fulfilled is no longer actually received —
+      // put it back in transit so it reappears as pending reception.
+      if (reception.transferId) {
+        await Transfer.findOneAndUpdate(
+          { _id: reception.transferId, status: "delivered" },
+          {
+            status: "in_transit",
+            deliveredAt: null,
+            deliveryConfirmedBy: "",
+            $push: {
+              editHistory: {
+                modifiedBy: req.user._id,
+                modifiedByName: req.user.name || req.user.username || "Unknown",
+                modifiedAt: new Date(),
+                changes: { status: { from: "delivered", to: "in_transit" } },
+                reason: `Reception ${reception.receptionId} was voided: ${reason || "Voided"}`,
+              },
+            },
+          },
+          { session }
+        );
+      }
+
       await session.commitTransaction();
     } catch (txError) {
       await session.abortTransaction();
@@ -448,6 +559,27 @@ router.delete("/:id", authMiddleware, async (req, res) => {
           { $inc: { stock: -reception.product.totalPieces } },
           { session }
         );
+
+        if (reception.transferId) {
+          await Transfer.findOneAndUpdate(
+            { _id: reception.transferId, status: "delivered" },
+            {
+              status: "in_transit",
+              deliveredAt: null,
+              deliveryConfirmedBy: "",
+              $push: {
+                editHistory: {
+                  modifiedBy: req.user._id,
+                  modifiedByName: req.user.name || req.user.username || "Unknown",
+                  modifiedAt: new Date(),
+                  changes: { status: { from: "delivered", to: "in_transit" } },
+                  reason: `Reception ${reception.receptionId} was deleted`,
+                },
+              },
+            },
+            { session }
+          );
+        }
       }
 
       await TransferReception.findByIdAndDelete(req.params.id).session(session);

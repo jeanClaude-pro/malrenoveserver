@@ -4,6 +4,7 @@ const router = express.Router();
 const mongoose = require("mongoose");
 const Transfer = require("../models/Transfer");
 const Product = require("../models/Product");
+const TransferReception = require("../models/TransferReception");
 const authMiddleware = require("../middleware/auth");
 
 // Helper function to generate a unique transfer ID
@@ -66,22 +67,15 @@ function computeTotalPieces(product) {
   return Number(product?.cartonQuantity || 0) * piecesPerCarton + Number(product?.looseQuantity || 0);
 }
 
-// Atomically deduct stock from inventory. Returns { ok: true } on success,
-// { ok: false } if there isn't enough stock available.
-async function deductStock(productId, totalPieces) {
-  if (!productId || totalPieces <= 0) return { ok: true };
-  const updated = await Product.findOneAndUpdate(
-    { _id: productId, stock: { $gte: totalPieces } },
-    { $inc: { stock: -totalPieces } },
-    { new: true }
-  );
-  return updated ? { ok: true, product: updated } : { ok: false };
-}
-
-// Return previously-deducted stock back to inventory (transfer cancelled/deleted/reduced).
-async function restoreStock(productId, totalPieces) {
-  if (!productId || totalPieces <= 0) return;
-  await Product.findByIdAndUpdate(productId, { $inc: { stock: totalPieces } });
+// A transfer is only a plan/record of intent to move stock — it must never mutate
+// Product.stock. The only place inventory is actually touched is a confirmed
+// reception in transferReceptions.js. This is a read-only sanity check so users
+// can't create a transfer for more than what's currently on hand; it does not
+// reserve or deduct anything.
+async function hasEnoughStock(productId, totalPieces) {
+  if (!productId || totalPieces <= 0) return true;
+  const product = await Product.findById(productId).lean();
+  return !!product && Number(product.stock || 0) >= totalPieces;
 }
 
 // ==================== GET ALL TRANSFERS (with filters) ====================
@@ -98,7 +92,12 @@ router.get("/", authMiddleware, async (req, res) => {
       return res.status(400).json({ error: timeframeError.message });
     }
 
-    if (status) filter.status = status;
+    if (status) {
+      // Allow comma-separated statuses (e.g. "pending,in_transit") so the reception
+      // screen can list every transfer that hasn't been received yet in one call.
+      const statuses = String(status).split(",").map((s) => s.trim()).filter(Boolean);
+      filter.status = statuses.length > 1 ? { $in: statuses } : statuses[0];
+    }
     if (destinationAgency) filter.destinationAgency = { $regex: destinationAgency, $options: "i" };
     if (vehiclePlate) filter["transport.vehiclePlate"] = { $regex: vehiclePlate, $options: "i" };
     if (search) {
@@ -173,7 +172,7 @@ router.post("/", authMiddleware, async (req, res) => {
     }
 
     if (!product?.productId) {
-      return res.status(400).json({ error: "Please select an existing product so it can be deducted from inventory" });
+      return res.status(400).json({ error: "Please select an existing inventory product for this transfer" });
     }
 
     if (!product?.name?.trim()) {
@@ -200,55 +199,48 @@ router.post("/", authMiddleware, async (req, res) => {
     const piecesPerCarton = Math.max(1, Number(product.piecesPerCarton || 1));
     const totalPieces = computeTotalPieces(product);
 
-    // Deduct stock from inventory now — the goods are leaving the source location.
-    const deduction = await deductStock(product.productId, totalPieces);
-    if (!deduction.ok) {
+    // Advisory only — creating a transfer never touches inventory itself, but we
+    // still warn if the requested quantity exceeds what's currently on hand.
+    if (!(await hasEnoughStock(product.productId, totalPieces))) {
       return res.status(409).json({
-        error: `Insufficient stock for "${product.name}" to complete this transfer.`,
+        error: `Insufficient stock for "${product.name}" to create this transfer.`,
       });
     }
 
-    let transfer;
-    try {
-      let customCreatedAt = null;
-      if (operationDate && req.user.isAdmin) {
-        const opDate = new Date(operationDate + "T12:00:00");
-        if (!isNaN(opDate.getTime()) && opDate <= new Date()) customCreatedAt = opDate;
-      }
-      transfer = new Transfer({
-        transferId: generateTransferId(),
-        product: {
-          productId: product.productId,
-          name: product.name.trim(),
-          cartonQuantity: Number(product.cartonQuantity || 0),
-          looseQuantity: Number(product.looseQuantity || 0),
-          piecesPerCarton,
-          totalPieces,
-        },
-        sourceLocation: sourceLocation.trim(),
-        destinationAgency: destinationAgency.trim(),
-        receiver: {
-          name: receiver?.name?.trim() || "",
-          phone: receiver?.phone?.trim() || "",
-        },
-        transport: {
-          driverName: transport?.driverName?.trim() || "",
-          vehiclePlate: transport?.vehiclePlate?.trim()?.toUpperCase() || "",
-          transportCompany: transport?.transportCompany?.trim() || "",
-          deliveryNotes: transport?.deliveryNotes?.trim() || "",
-        },
-        notes: notes?.trim() || "",
-        status: "pending",
-        createdBy: req.user.userId,
-        createdByName: req.user.name || req.user.username || "Unknown",
-      });
-      if (customCreatedAt) transfer.createdAt = customCreatedAt;
-      await transfer.save();
-    } catch (saveError) {
-      // Roll back the stock deduction since the transfer record was never created.
-      await restoreStock(product.productId, totalPieces);
-      throw saveError;
+    let customCreatedAt = null;
+    if (operationDate && req.user.isAdmin) {
+      const opDate = new Date(operationDate + "T12:00:00");
+      if (!isNaN(opDate.getTime()) && opDate <= new Date()) customCreatedAt = opDate;
     }
+    const transfer = new Transfer({
+      transferId: generateTransferId(),
+      product: {
+        productId: product.productId,
+        name: product.name.trim(),
+        cartonQuantity: Number(product.cartonQuantity || 0),
+        looseQuantity: Number(product.looseQuantity || 0),
+        piecesPerCarton,
+        totalPieces,
+      },
+      sourceLocation: sourceLocation.trim(),
+      destinationAgency: destinationAgency.trim(),
+      receiver: {
+        name: receiver?.name?.trim() || "",
+        phone: receiver?.phone?.trim() || "",
+      },
+      transport: {
+        driverName: transport?.driverName?.trim() || "",
+        vehiclePlate: transport?.vehiclePlate?.trim()?.toUpperCase() || "",
+        transportCompany: transport?.transportCompany?.trim() || "",
+        deliveryNotes: transport?.deliveryNotes?.trim() || "",
+      },
+      notes: notes?.trim() || "",
+      status: "pending",
+      createdBy: req.user.userId,
+      createdByName: req.user.name || req.user.username || "Unknown",
+    });
+    if (customCreatedAt) transfer.createdAt = customCreatedAt;
+    await transfer.save();
 
     res.status(201).json({
       success: true,
@@ -274,9 +266,15 @@ router.patch("/:id/status", authMiddleware, async (req, res) => {
     const { id } = req.params;
     const { status, reason } = req.body;
 
-    const validStatuses = ["pending", "in_transit", "delivered", "cancelled"];
+    // "delivered" is a system-driven outcome of a confirmed reception (see
+    // POST /transfer-receptions) — it is never set by hand, so that a transfer can
+    // only ever be marked delivered together with the reception record and
+    // inventory update that justify it.
+    const validStatuses = ["pending", "in_transit", "cancelled"];
     if (!validStatuses.includes(status)) {
-      return res.status(400).json({ error: "Invalid status" });
+      return res.status(400).json({
+        error: `Invalid status. Use one of: ${validStatuses.join(", ")}. "delivered" can only be set by confirming a reception in Transfer Reception.`,
+      });
     }
 
     const transfer = await Transfer.findById(id);
@@ -287,29 +285,26 @@ router.patch("/:id/status", authMiddleware, async (req, res) => {
     const oldStatus = transfer.status;
     const modifiedByName = req.user.name || req.user.username || "Unknown";
 
-    if (status !== oldStatus) {
-      const productId = transfer.product?.productId;
-      const totalPieces = transfer.product?.totalPieces || 0;
-
-      if (oldStatus !== "cancelled" && status === "cancelled") {
-        // The goods never left (or are coming back) — give the stock back.
-        await restoreStock(productId, totalPieces);
-      } else if (oldStatus === "cancelled" && status !== "cancelled") {
-        // Re-activating a previously cancelled transfer — deduct again.
-        const deduction = await deductStock(productId, totalPieces);
-        if (!deduction.ok) {
-          return res.status(409).json({
-            error: `Insufficient stock for "${transfer.product?.name}" to reactivate this transfer.`,
-          });
-        }
+    // A transfer that was already received has a linked reception record which has
+    // already added its stock to the destination. Changing it here would desync
+    // that reception from reality, so require voiding the reception first instead
+    // of silently reverting the transfer underneath it.
+    if (status !== oldStatus && oldStatus === "delivered") {
+      const linkedReception = await TransferReception.findOne({
+        transferId: transfer._id,
+        status: "active",
+      }).lean();
+      if (linkedReception) {
+        return res.status(409).json({
+          error: `This transfer was already received (reception ${linkedReception.receptionId}). Void that reception first if you need to change this transfer's status.`,
+        });
       }
     }
 
+    // Status changes here are purely a label on the transfer's lifecycle — they
+    // never touch Product.stock. Only a confirmed reception in
+    // transferReceptions.js adds to inventory.
     transfer.status = status;
-    if (status === "delivered") {
-      transfer.deliveredAt = new Date();
-      transfer.deliveryConfirmedBy = modifiedByName;
-    }
     transfer.lastModifiedBy = req.user.userId;
     transfer.lastModifiedByName = modifiedByName;
 
@@ -356,6 +351,18 @@ router.put("/:id", authMiddleware, async (req, res) => {
       return res.status(404).json({ error: "Transfer not found" });
     }
 
+    if (transfer.status === "delivered" && product) {
+      const linkedReception = await TransferReception.findOne({
+        transferId: transfer._id,
+        status: "active",
+      }).lean();
+      if (linkedReception) {
+        return res.status(409).json({
+          error: `This transfer was already received (reception ${linkedReception.receptionId}). Void that reception first if you need to change the product or quantity.`,
+        });
+      }
+    }
+
     const changes = new Map();
 
     if (sourceLocation && sourceLocation !== transfer.sourceLocation) {
@@ -381,20 +388,13 @@ router.put("/:id", authMiddleware, async (req, res) => {
       const productChanged = String(newProductId || "") !== String(oldProductId || "");
       const quantityChanged = newTotalPieces !== oldTotalPieces;
 
-      // The stock currently sitting deducted in inventory only reflects reality
-      // while the transfer is active (not cancelled). Adjust it to match the edit.
-      if (transfer.status !== "cancelled" && (productChanged || quantityChanged)) {
-        if (oldProductId) await restoreStock(oldProductId, oldTotalPieces);
-
-        if (newProductId) {
-          const deduction = await deductStock(newProductId, newTotalPieces);
-          if (!deduction.ok) {
-            // Put the old amount back exactly as it was before we touch anything else.
-            if (oldProductId) await deductStock(oldProductId, oldTotalPieces);
-            return res.status(409).json({
-              error: `Insufficient stock for "${product.name || transfer.product.name}" to apply this change.`,
-            });
-          }
+      // Advisory only — editing a transfer never touches inventory itself (only a
+      // confirmed reception does), but warn if the new quantity exceeds current stock.
+      if ((productChanged || quantityChanged) && newProductId) {
+        if (!(await hasEnoughStock(newProductId, newTotalPieces))) {
+          return res.status(409).json({
+            error: `Insufficient stock for "${product.name || transfer.product.name}" to apply this change.`,
+          });
         }
       }
 
@@ -480,11 +480,20 @@ router.delete("/:id", authMiddleware, async (req, res) => {
       return res.status(404).json({ error: "Transfer not found" });
     }
 
-    // Give the stock back unless it was already returned when the transfer was cancelled.
-    if (transfer.status !== "cancelled") {
-      await restoreStock(transfer.product?.productId, transfer.product?.totalPieces || 0);
+    if (transfer.status === "delivered") {
+      const linkedReception = await TransferReception.findOne({
+        transferId: transfer._id,
+        status: "active",
+      }).lean();
+      if (linkedReception) {
+        return res.status(409).json({
+          error: `This transfer was already received (reception ${linkedReception.receptionId}). Void that reception first — deleting the transfer would orphan its reception history.`,
+        });
+      }
     }
 
+    // Deleting a transfer never touches inventory — it was never deducted when
+    // created, so there's nothing to restore.
     await transfer.deleteOne();
 
     res.json({ success: true, message: "Transfer deleted successfully" });
