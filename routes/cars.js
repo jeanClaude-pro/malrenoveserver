@@ -4,6 +4,7 @@ const router = express.Router();
 const mongoose = require("mongoose");
 const CarTrip = require("../models/Cars");
 const Product = require("../models/Product");
+const StockMovement = require("../models/StockMovement");
 const authMiddleware = require("../middleware/auth");
 
 // Helper function to generate unique trip ID
@@ -241,13 +242,24 @@ router.post("/", authMiddleware, async (req, res) => {
     if (!vehicle?.plateNumber) {
       return res.status(400).json({ error: "Vehicle plate number is required" });
     }
-    
-    if (!cargo?.productName?.trim() || !cargo?.boxesCount || !cargo?.piecesPerBox) {
-      return res.status(400).json({ error: "Cargo product name, boxes count, and pieces per box are required" });
+
+    if (!cargo?.productId || !mongoose.Types.ObjectId.isValid(cargo.productId)) {
+      return res.status(400).json({ error: "Veuillez sélectionner un produit existant pour le chargement" });
+    }
+    if (!cargo?.boxesCount || !cargo?.piecesPerBox) {
+      return res.status(400).json({ error: "Cargo boxes count and pieces per carton are required" });
     }
 
     if (!departureTime) {
       return res.status(400).json({ error: "Departure time is required" });
+    }
+
+    const cargoProduct = await Product.findById(cargo.productId).lean();
+    if (!cargoProduct) {
+      return res.status(404).json({ error: "Produit du chargement introuvable" });
+    }
+    if (cargoProduct.status !== "active") {
+      return res.status(400).json({ error: `Impossible d'expédier un produit inactif: ${cargoProduct.name}` });
     }
 
     // Calculate total pieces
@@ -269,7 +281,8 @@ router.post("/", authMiddleware, async (req, res) => {
         capacity: vehicle.capacity || 0,
       },
       cargo: {
-        productName: cargo.productName.trim(),
+        productId: cargoProduct._id,
+        productName: cargoProduct.name,
         boxesCount: cargo.boxesCount,
         piecesPerBox: cargo.piecesPerBox,
         totalPieces: totalPieces,
@@ -380,7 +393,54 @@ router.patch("/:id/confirm-arrival", authMiddleware, async (req, res) => {
       reason: `Arrivée confirmée — ${rBoxes} cartons × ${rPieces} pcs/carton = ${totalReceived} pcs reçues`,
     });
 
-    await trip.save();
+    // Add the received goods to inventory — only trips linked to a real
+    // product (created after the product-select feature) can be credited.
+    const cargoProductId = trip.cargo?.productId;
+    if (cargoProductId && totalReceived > 0) {
+      const product = await Product.findById(cargoProductId);
+      if (product) {
+        const session = await mongoose.startSession();
+        try {
+          session.startTransaction();
+
+          await Product.findByIdAndUpdate(
+            cargoProductId,
+            { $inc: { stock: totalReceived } },
+            { session }
+          );
+
+          await StockMovement.create(
+            [
+              {
+                productId: cargoProductId,
+                productName: product.name,
+                type: "car_arrival",
+                quantity: totalReceived,
+                piecesPerCarton: rPieces > 0 ? rPieces : product.piecesPerCarton || 1,
+                reference: trip.tripId,
+                notes: (notes || "").trim(),
+                recordedBy: confirmedBy,
+                recordedByUserId: req.user.userId,
+              },
+            ],
+            { session }
+          );
+
+          await trip.save({ session });
+          await session.commitTransaction();
+        } catch (txError) {
+          await session.abortTransaction();
+          throw txError;
+        } finally {
+          await session.endSession();
+        }
+      } else {
+        // Linked product no longer exists — confirm arrival without touching inventory.
+        await trip.save();
+      }
+    } else {
+      await trip.save();
+    }
 
     res.json({
       success: true,
