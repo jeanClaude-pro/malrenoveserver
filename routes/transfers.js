@@ -4,6 +4,7 @@ const router = express.Router();
 const mongoose = require("mongoose");
 const Transfer = require("../models/Transfer");
 const Product = require("../models/Product");
+const StockMovement = require("../models/StockMovement");
 const TransferReception = require("../models/TransferReception");
 const authMiddleware = require("../middleware/auth");
 
@@ -329,6 +330,114 @@ router.patch("/:id/status", authMiddleware, async (req, res) => {
       return res.status(400).json({ error: "Invalid transfer ID format" });
     }
     res.status(500).json({ error: "Failed to update transfer status", details: process.env.NODE_ENV !== "production" ? error.message : undefined });
+  }
+});
+
+// ==================== CONFIRM DELIVERY & DEDUCT SOURCE INVENTORY ====================
+router.patch("/:id/confirm-delivery", authMiddleware, async (req, res) => {
+  const session = await mongoose.startSession();
+  try {
+    const { id } = req.params;
+    const reason = String(req.body?.reason || "").trim();
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({ error: "Invalid transfer ID format" });
+    }
+
+    let deliveredTransfer;
+    let remainingStock;
+    await session.withTransaction(async () => {
+      const transfer = await Transfer.findById(id).session(session);
+      if (!transfer) {
+        const error = new Error("Transfer not found");
+        error.status = 404;
+        throw error;
+      }
+      if (transfer.status === "cancelled") {
+        const error = new Error("A cancelled transfer cannot be confirmed as delivered");
+        error.status = 409;
+        throw error;
+      }
+      if (transfer.status === "delivered" || transfer.inventoryDeducted) {
+        const error = new Error("This transfer has already been confirmed as delivered");
+        error.status = 409;
+        throw error;
+      }
+      if (!transfer.product?.productId) {
+        const error = new Error("This transfer is not linked to an inventory product");
+        error.status = 409;
+        throw error;
+      }
+
+      const quantity = Number(transfer.product.totalPieces || 0);
+      if (!Number.isInteger(quantity) || quantity <= 0) {
+        const error = new Error("The transfer quantity is invalid");
+        error.status = 400;
+        throw error;
+      }
+
+      // The stock predicate makes the subtraction safe even if two requests race.
+      const product = await Product.findOneAndUpdate(
+        { _id: transfer.product.productId, status: "active", stock: { $gte: quantity } },
+        { $inc: { stock: -quantity } },
+        { new: true, session }
+      );
+      if (!product) {
+        const current = await Product.findById(transfer.product.productId).session(session).lean();
+        const error = new Error(current
+          ? `Insufficient stock for "${transfer.product.name}". Available: ${current.stock}, required: ${quantity}`
+          : "The linked inventory product was not found or is inactive");
+        error.status = 409;
+        throw error;
+      }
+
+      const confirmedBy = req.user.name || req.user.username || "Unknown";
+      const deliveredAt = new Date();
+      const previousStatus = transfer.status;
+      transfer.status = "delivered";
+      transfer.deliveredAt = deliveredAt;
+      transfer.deliveryConfirmedBy = confirmedBy;
+      transfer.inventoryDeducted = true;
+      transfer.lastModifiedBy = req.user.userId;
+      transfer.lastModifiedByName = confirmedBy;
+      transfer.editHistory.push({
+        modifiedBy: req.user.userId,
+        modifiedByName: confirmedBy,
+        modifiedAt: deliveredAt,
+        changes: { status: { from: previousStatus, to: "delivered" }, inventory: { deducted: quantity } },
+        reason: reason || "Livraison confirmée et stock déduit",
+      });
+      await transfer.save({ session });
+
+      await StockMovement.create([{
+        productId: product._id,
+        productName: product.name,
+        type: "transfer_out",
+        quantity,
+        piecesPerCarton: transfer.product.piecesPerCarton || product.piecesPerCarton || 1,
+        reference: transfer.transferId,
+        notes: `Transfert livré à ${transfer.destinationAgency}${reason ? ` — ${reason}` : ""}`,
+        recordedBy: confirmedBy,
+        recordedByUserId: req.user.userId,
+      }], { session });
+
+      deliveredTransfer = transfer;
+      remainingStock = product.stock;
+    });
+
+    res.json({
+      success: true,
+      message: "Delivery confirmed and inventory deducted",
+      data: deliveredTransfer,
+      inventory: { deducted: deliveredTransfer.product.totalPieces, remainingStock },
+    });
+  } catch (error) {
+    console.error("Error confirming transfer delivery:", error.name, error.message);
+    res.status(error.status || 500).json({
+      error: error.status ? error.message : "Failed to confirm delivery",
+      details: process.env.NODE_ENV !== "production" && !error.status ? error.message : undefined,
+    });
+  } finally {
+    await session.endSession();
   }
 });
 

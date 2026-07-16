@@ -108,6 +108,10 @@ const transferSchema = new mongoose.Schema(
       type: String,
       default: "",
     },
+    inventoryDeducted: {
+      type: Boolean,
+      default: false,
+    },
     notes: {
       type: String,
       trim: true,

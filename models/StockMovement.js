@@ -14,7 +14,7 @@ const stockMovementSchema = new mongoose.Schema(
     },
     type: {
       type: String,
-      enum: ["loan", "loan_return", "bonus_manual", "adjustment_in", "adjustment_out", "car_arrival"],
+      enum: ["loan", "loan_return", "bonus_manual", "adjustment_in", "adjustment_out", "car_arrival", "transfer_out"],
       required: true,
     },
     quantity: {

@@ -26,7 +26,7 @@ router.get("/", authMiddleware, async (req, res) => {
     }
 
     if (type) {
-      const validTypes = ["loan", "loan_return", "bonus_manual", "adjustment_in", "adjustment_out", "car_arrival"];
+      const validTypes = ["loan", "loan_return", "bonus_manual", "adjustment_in", "adjustment_out", "car_arrival", "transfer_out"];
       if (!validTypes.includes(type)) {
         return res.status(400).json({ error: `Type invalide. Valeurs: ${validTypes.join(", ")}` });
       }
