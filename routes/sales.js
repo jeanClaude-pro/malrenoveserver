@@ -2,6 +2,7 @@
 const express = require("express");
 const router = express.Router();
 const mongoose = require("mongoose");
+const { randomUUID } = require("crypto");
 const Sale = require("../models/Sale");
 const Customer = require("../models/Customer");
 const Product = require("../models/Product");
@@ -86,6 +87,91 @@ function buildSaleQuantities(item, piecesPerCarton) {
 
 function getLineTotal(paidPieces, piecesPerCarton, boxPrice) {
   return Number(boxPrice) * (Number(paidPieces) / Math.max(1, Number(piecesPerCarton || 1)));
+}
+
+const VALID_REVENUE_STATUS_FILTER = {
+  $nin: ["voided", "corrected", "cancelled", "refunded"],
+};
+
+// Revenue is cash actually received: immediate-payment sales at sale time, plus
+// credit payments at the time the seller confirms receipt. Credit invoices are
+// deliberately absent until that confirmation happens.
+async function getReceivedRevenue(createdAt, scope = {}) {
+  const validSaleMatch = {
+    $and: [
+      {
+        status: VALID_REVENUE_STATUS_FILTER,
+        type: { $in: ["sale", "reservation"] },
+      },
+      scope,
+    ],
+  };
+
+  const [cashSales, creditPayments] = await Promise.all([
+    Sale.aggregate([
+      {
+        $match: {
+          ...validSaleMatch,
+          paymentType: { $ne: "credit" },
+          createdAt,
+        },
+      },
+      {
+        $project: {
+          _id: 0,
+          saleId: 1,
+          amount: "$total",
+          receivedAt: "$createdAt",
+          kind: { $literal: "cash_sale" },
+        },
+      },
+    ]),
+    Sale.aggregate([
+      { $match: { ...validSaleMatch, paymentType: "credit" } },
+      { $unwind: "$creditDetails.payments" },
+      {
+        $match: {
+          // Payments written before confirmation states were introduced were
+          // already treated as received, so retain that historical meaning.
+          $or: [
+            { "creditDetails.payments.status": "confirmed" },
+            { "creditDetails.payments.status": { $exists: false } },
+          ],
+        },
+      },
+      {
+        $project: {
+          _id: 0,
+          saleId: 1,
+          amount: "$creditDetails.payments.amount",
+          receivedAt: {
+            $ifNull: [
+              "$creditDetails.payments.confirmedAt",
+              "$creditDetails.payments.date",
+            ],
+          },
+          kind: { $literal: "credit_payment" },
+        },
+      },
+      { $match: { receivedAt: createdAt } },
+    ]),
+  ]);
+
+  const cashAmount = cashSales.reduce((sum, event) => sum + Number(event.amount || 0), 0);
+  const creditAmount = creditPayments.reduce(
+    (sum, event) => sum + Number(event.amount || 0),
+    0
+  );
+  return {
+    amount: cashAmount + creditAmount,
+    cashAmount,
+    creditAmount,
+    cashSaleCount: cashSales.length,
+    confirmedCreditPaymentCount: creditPayments.length,
+    events: [...cashSales, ...creditPayments].sort(
+      (a, b) => new Date(a.receivedAt) - new Date(b.receivedAt)
+    ),
+  };
 }
 
 // Helper function to update customer data (FIXED)
@@ -375,22 +461,30 @@ router.get("/", authMiddleware, async (req, res) => {
     const timeframeDescription = getTimeframeDescription(req.query);
     const timeframeFilter = buildTimeframeFilter(req.query);
     
-    // Calculate totals for quick insights
+    // Calculate operational totals for quick insights. Revenue itself is
+    // calculated from receipt events below, not from credit invoice totals.
     const totals = sales.reduce((acc, sale) => {
       if (sale.type === "expense") {
         acc.totalExpenses += sale.total;
         acc.expenseCount += 1;
       } else {
-        acc.totalRevenue += sale.total;
         acc.saleCount += 1;
       }
       return acc;
     }, {
-      totalRevenue: 0,
       totalExpenses: 0,
       saleCount: 0,
       expenseCount: 0
     });
+    const revenueScope = {
+      ...(customerPhone && { "customer.phone": customerPhone }),
+      ...(status ? { status } : { status: { $in: ["completed", "pending", "expense"] } }),
+      ...(type && { type }),
+    };
+    const receivedRevenue = await getReceivedRevenue(
+      timeframeFilter.createdAt,
+      revenueScope
+    );
     
     // Prepare response with timeframe metadata
     const response = {
@@ -410,12 +504,16 @@ router.get("/", authMiddleware, async (req, res) => {
       },
       summary: {
         totalRecords: total,
-        revenue: totals.totalRevenue,
+        revenue: receivedRevenue.amount,
+        cashSalesRevenue: receivedRevenue.cashAmount,
+        confirmedCreditPayments: receivedRevenue.creditAmount,
+        confirmedCreditPaymentCount: receivedRevenue.confirmedCreditPaymentCount,
         expenses: totals.totalExpenses,
-        net: totals.totalRevenue - totals.totalExpenses,
+        net: receivedRevenue.amount - totals.totalExpenses,
         salesCount: totals.saleCount,
         expensesCount: totals.expenseCount
       },
+      revenueEvents: receivedRevenue.events,
       filtersApplied: {
         customerPhone: customerPhone || 'none',
         status: status || 'default (completed, pending, expense)',
@@ -511,7 +609,6 @@ router.get("/stats/daily", authMiddleware, async (req, res) => {
         $group: {
           _id: null,
           totalSales: { $sum: 1 },
-          totalRevenue: { $sum: "$total" },
           totalItems: { $sum: { $size: "$items" } },
         },
       },
@@ -527,10 +624,18 @@ router.get("/stats/daily", authMiddleware, async (req, res) => {
     .select('-__v')
     .lean();
 
+    const receivedRevenue = await getReceivedRevenue({
+      $gte: startOfDay,
+      $lte: endOfDay,
+    });
+
     res.json({
       date: targetDate.toISOString().split("T")[0],
       totalSales: dailySales[0]?.totalSales || 0,
-      totalRevenue: dailySales[0]?.totalRevenue || 0,
+      totalRevenue: receivedRevenue.amount,
+      cashSalesRevenue: receivedRevenue.cashAmount,
+      confirmedCreditPayments: receivedRevenue.creditAmount,
+      revenueEvents: receivedRevenue.events,
       totalItems: dailySales[0]?.totalItems || 0,
       sales,
     });
@@ -753,27 +858,34 @@ router.post("/", authMiddleware, async (req, res) => {
     let creditDetailsData = undefined;
 
     if (isCreditSale) {
-      const initialPaid = Math.max(0, parseFloat(creditAmountPaid) || 0);
+      const initialPaid = Math.round(
+        Math.max(0, parseFloat(creditAmountPaid) || 0) * 100
+      ) / 100;
       if (initialPaid > total + 0.001) {
         return res.status(400).json({
           error: "Le montant versé ne peut pas dépasser le total de la vente",
         });
       }
-      const amountDue = Math.max(0, total - initialPaid);
       creditDetailsData = {
-        amountPaid: initialPaid,
-        amountDue,
+        // An advance is only a reported payment until the seller explicitly
+        // acknowledges receipt. The receivable therefore starts at the full
+        // invoice amount.
+        amountPaid: 0,
+        amountDue: total,
+        pendingAmount: initialPaid,
         dueDate: creditDueDate ? new Date(creditDueDate) : null,
-        fullyPaid: amountDue < 0.01,
+        fullyPaid: false,
         payments:
           initialPaid > 0
             ? [
                 {
+                  paymentId: randomUUID(),
                   amount: initialPaid,
                   date: new Date(),
                   method: normalizedPM,
                   recordedBy: salesPerson || "Admin",
                   notes: "Versement initial",
+                  status: "pending",
                 },
               ]
             : [],
@@ -1369,72 +1481,255 @@ router.patch("/:id/pending", authMiddleware, async (req, res) => {
   }
 });
 
-/** ---------- RECORD CREDIT PAYMENT ---------- **/
+/**
+ * Record a payment event without treating it as received cash. paymentId is an
+ * idempotency key supplied by the client and is scoped to this sale.
+ */
 router.patch("/:id/credit-payment", authMiddleware, async (req, res) => {
   try {
     const { id } = req.params;
     const { amount, method, notes } = req.body;
+    const paymentId = String(
+      req.body.paymentId || req.get("Idempotency-Key") || ""
+    ).trim();
+    const rawPaymentAmount = Number(amount);
+    const paymentAmount = Math.round(rawPaymentAmount * 100) / 100;
 
-    const paymentAmount = parseFloat(amount);
-    if (!Number.isFinite(paymentAmount) || paymentAmount <= 0) {
-      return res.status(400).json({ error: "Le montant du paiement doit être supérieur à zéro" });
+    if (!Number.isFinite(rawPaymentAmount) || paymentAmount <= 0) {
+      return res.status(400).json({ error: "Le montant du paiement doit être positif" });
+    }
+    if (!paymentId || paymentId.length > 128) {
+      return res.status(400).json({ error: "L'identifiant paymentId est requis" });
     }
 
     const normalizedMethod = normalizePaymentMethod(method || "cash");
-
-    const sale = await Sale.findById(id).lean();
-    if (!sale) {
-      return res.status(404).json({ error: "Vente non trouvée" });
-    }
-
-    if (sale.paymentType !== "credit") {
-      return res.status(400).json({ error: "Cette vente n'est pas une vente à crédit" });
-    }
-
-    if (sale.status === "voided") {
-      return res.status(400).json({ error: "Impossible d'enregistrer un paiement sur une vente annulée" });
-    }
-
-    const currentAmountDue = sale.creditDetails?.amountDue ?? 0;
-    if (paymentAmount > currentAmountDue + 0.001) {
-      return res.status(400).json({
-        error: `Le montant dépasse le solde dû (${currentAmountDue.toFixed(2)} USD)`,
-      });
-    }
-
-    const newAmountPaid = (sale.creditDetails?.amountPaid ?? 0) + paymentAmount;
-    const newAmountDue = Math.max(0, (sale.creditDetails?.amountDue ?? sale.total) - paymentAmount);
-    const fullyPaid = newAmountDue < 0.01;
-
-    const updatedSale = await Sale.findByIdAndUpdate(
-      id,
+    const updatedSale = await Sale.findOneAndUpdate(
       {
-        "creditDetails.amountPaid": newAmountPaid,
-        "creditDetails.amountDue": newAmountDue,
-        "creditDetails.fullyPaid": fullyPaid,
+        _id: id,
+        paymentType: "credit",
+        status: VALID_REVENUE_STATUS_FILTER,
+        "creditDetails.payments.paymentId": { $ne: paymentId },
+        $expr: {
+          $lte: [
+            {
+              $add: [
+                { $ifNull: ["$creditDetails.pendingAmount", 0] },
+                paymentAmount,
+              ],
+            },
+            { $ifNull: ["$creditDetails.amountDue", "$total"] },
+          ],
+        },
+      },
+      {
+        $inc: { "creditDetails.pendingAmount": paymentAmount },
         $push: {
           "creditDetails.payments": {
+            paymentId,
             amount: paymentAmount,
             date: new Date(),
             method: normalizedMethod,
             recordedBy: req.user.username || req.user.userId,
             notes: notes || "",
+            status: "pending",
           },
         },
       },
       { new: true, runValidators: true }
     );
 
-    res.json({
+    if (!updatedSale) {
+      const sale = await Sale.findById(id).lean();
+      if (!sale) return res.status(404).json({ error: "Vente non trouvée" });
+      if (sale.paymentType !== "credit") {
+        return res.status(400).json({ error: "Cette vente n'est pas à crédit" });
+      }
+      if (["voided", "corrected", "cancelled", "refunded"].includes(sale.status)) {
+        return res.status(400).json({ error: "Aucun paiement ne peut être ajouté à cette vente" });
+      }
+
+      const existing = sale.creditDetails?.payments?.find(
+        (payment) => payment.paymentId === paymentId
+      );
+      if (existing) {
+        if (
+          Math.abs(Number(existing.amount) - paymentAmount) > 0.001 ||
+          existing.method !== normalizedMethod ||
+          String(existing.notes || "") !== String(notes || "")
+        ) {
+          return res.status(409).json({
+            error: "Ce paymentId est déjà utilisé avec des données différentes",
+          });
+        }
+        return res.json({
+          success: true,
+          idempotent: true,
+          message: "Paiement déjà enregistré et en attente de confirmation",
+          payment: existing,
+          sale,
+        });
+      }
+
+      const available = Math.max(
+        0,
+        Number(sale.creditDetails?.amountDue ?? sale.total) -
+          Number(sale.creditDetails?.pendingAmount || 0)
+      );
+      return res.status(409).json({
+        error: `Le paiement dépasse le solde disponible (${available.toFixed(2)} USD)`,
+      });
+    }
+
+    const payment = updatedSale.creditDetails.payments.find(
+      (candidate) => candidate.paymentId === paymentId
+    );
+    return res.status(202).json({
       success: true,
-      message: fullyPaid ? "Crédit soldé avec succès!" : "Paiement enregistré avec succès",
+      message: "Paiement enregistré; confirmez sa réception avant l'encaissement",
+      payment,
       sale: updatedSale,
     });
   } catch (error) {
-    console.error("Error recording credit payment:", error);
-    res.status(500).json({ error: "Échec de l'enregistrement du paiement" });
+    console.error("Error recording pending credit payment:", error);
+    return res.status(500).json({ error: "Échec de l'enregistrement du paiement" });
   }
 });
+
+/** Atomically acknowledge receipt and move a pending payment into revenue. */
+router.patch(
+  "/:id/credit-payments/:paymentId/confirm",
+  authMiddleware,
+  async (req, res) => {
+    try {
+      const { id, paymentId } = req.params;
+      const sale = await Sale.findById(id).lean();
+      if (!sale) return res.status(404).json({ error: "Vente non trouvée" });
+      if (sale.paymentType !== "credit") {
+        return res.status(400).json({ error: "Cette vente n'est pas à crédit" });
+      }
+
+      const payment = sale.creditDetails?.payments?.find(
+        (candidate) => candidate.paymentId === paymentId
+      );
+      if (!payment) return res.status(404).json({ error: "Paiement non trouvé" });
+      if (!payment.status || payment.status === "confirmed") {
+        return res.json({
+          success: true,
+          idempotent: true,
+          message: "La réception est déjà confirmée",
+          payment,
+          sale,
+        });
+      }
+
+      const paymentAmount = Number(payment.amount);
+      const confirmedAt = new Date();
+      const confirmedBy = req.user.username || req.user.userId;
+      const updatedSale = await Sale.findOneAndUpdate(
+        {
+          _id: id,
+          paymentType: "credit",
+          status: VALID_REVENUE_STATUS_FILTER,
+          "creditDetails.amountDue": { $gte: paymentAmount },
+          "creditDetails.payments": {
+            $elemMatch: { paymentId, status: "pending", amount: paymentAmount },
+          },
+        },
+        [
+          {
+            $set: {
+              "creditDetails.amountPaid": {
+                $add: [{ $ifNull: ["$creditDetails.amountPaid", 0] }, paymentAmount],
+              },
+              "creditDetails.amountDue": {
+                $max: [
+                  0,
+                  {
+                    $subtract: [
+                      { $ifNull: ["$creditDetails.amountDue", "$total"] },
+                      paymentAmount,
+                    ],
+                  },
+                ],
+              },
+              "creditDetails.pendingAmount": {
+                $max: [
+                  0,
+                  {
+                    $subtract: [
+                      { $ifNull: ["$creditDetails.pendingAmount", paymentAmount] },
+                      paymentAmount,
+                    ],
+                  },
+                ],
+              },
+              "creditDetails.payments": {
+                $map: {
+                  input: "$creditDetails.payments",
+                  as: "payment",
+                  in: {
+                    $cond: [
+                      { $eq: ["$$payment.paymentId", paymentId] },
+                      {
+                        $mergeObjects: [
+                          "$$payment",
+                          { status: "confirmed", confirmedAt, confirmedBy },
+                        ],
+                      },
+                      "$$payment",
+                    ],
+                  },
+                },
+              },
+            },
+          },
+          {
+            $set: {
+              "creditDetails.fullyPaid": {
+                $lte: ["$creditDetails.amountDue", 0.009],
+              },
+            },
+          },
+        ],
+        { new: true }
+      );
+
+      if (!updatedSale) {
+        const currentSale = await Sale.findById(id).lean();
+        const currentPayment = currentSale?.creditDetails?.payments?.find(
+          (candidate) => candidate.paymentId === paymentId
+        );
+        if (!currentPayment?.status || currentPayment.status === "confirmed") {
+          return res.json({
+            success: true,
+            idempotent: true,
+            message: "La réception est déjà confirmée",
+            payment: currentPayment,
+            sale: currentSale,
+          });
+        }
+        return res.status(409).json({
+          error: "Le paiement n'a pas pu être confirmé; actualisez la vente",
+        });
+      }
+
+      const confirmedPayment = updatedSale.creditDetails.payments.find(
+        (candidate) => candidate.paymentId === paymentId
+      );
+      return res.json({
+        success: true,
+        message: updatedSale.creditDetails.fullyPaid
+          ? "Argent reçu et crédit entièrement soldé"
+          : "Argent reçu et dette mise à jour",
+        payment: confirmedPayment,
+        sale: updatedSale,
+      });
+    } catch (error) {
+      console.error("Error confirming credit payment:", error);
+      return res.status(500).json({ error: "Échec de la confirmation du paiement" });
+    }
+  }
+);
 
 /** ---------- VOID/REFUND SALE ---------- **/
 router.patch("/:id/void", authMiddleware, async (req, res) => {

@@ -13,13 +13,14 @@ const TZ = "+02:00";
 // Returns every calendar day that has at least one transaction, in date order,
 // with openingBalance and closingBalance correctly chained.
 async function computeAllDailyBalances() {
-  const [salesByDay, entriesByDay, expensesByDay] = await Promise.all([
-    // Sales revenue: exclude voided/refunded/cancelled and expense-type records
+  const [cashSalesByDay, creditPaymentsByDay, entriesByDay, expensesByDay] = await Promise.all([
+    // Immediate-payment sales enter the report on the sale date.
     Sale.aggregate([
       {
         $match: {
-          status: { $nin: ["voided", "cancelled", "refunded"] },
+          status: { $nin: ["voided", "corrected", "cancelled", "refunded"] },
           type: { $ne: "expense" },
+          paymentType: { $ne: "credit" },
         },
       },
       {
@@ -28,6 +29,46 @@ async function computeAllDailyBalances() {
             $dateToString: { format: "%Y-%m-%d", date: "$createdAt", timezone: TZ },
           },
           salesRevenue: { $sum: "$total" },
+          salesCount: { $sum: 1 },
+        },
+      },
+      { $sort: { _id: 1 } },
+    ]),
+
+    // Credit invoices are receivables. Only an explicitly confirmed payment
+    // enters cash revenue, on its confirmation date (not the invoice date).
+    Sale.aggregate([
+      {
+        $match: {
+          status: { $nin: ["voided", "corrected", "cancelled", "refunded"] },
+          type: { $ne: "expense" },
+          paymentType: "credit",
+        },
+      },
+      { $unwind: "$creditDetails.payments" },
+      {
+        $match: {
+          $or: [
+            { "creditDetails.payments.status": "confirmed" },
+            { "creditDetails.payments.status": { $exists: false } },
+          ],
+        },
+      },
+      {
+        $group: {
+          _id: {
+            $dateToString: {
+              format: "%Y-%m-%d",
+              date: {
+                $ifNull: [
+                  "$creditDetails.payments.confirmedAt",
+                  "$creditDetails.payments.date",
+                ],
+              },
+              timezone: TZ,
+            },
+          },
+          salesRevenue: { $sum: "$creditDetails.payments.amount" },
           salesCount: { $sum: 1 },
         },
       },
@@ -65,7 +106,7 @@ async function computeAllDailyBalances() {
     ]),
   ]);
 
-  // Merge all three streams into a single map keyed by YYYY-MM-DD
+  // Merge all transaction streams into a single map keyed by YYYY-MM-DD
   const dayMap = new Map();
   const ensure = (dateStr) => {
     if (!dayMap.has(dateStr)) {
@@ -82,10 +123,10 @@ async function computeAllDailyBalances() {
     return dayMap.get(dateStr);
   };
 
-  for (const s of salesByDay) {
+  for (const s of [...cashSalesByDay, ...creditPaymentsByDay]) {
     const d = ensure(s._id);
-    d.salesRevenue = Number(s.salesRevenue) || 0;
-    d.salesCount = s.salesCount || 0;
+    d.salesRevenue += Number(s.salesRevenue) || 0;
+    d.salesCount += s.salesCount || 0;
   }
   for (const e of entriesByDay) {
     const d = ensure(e._id);

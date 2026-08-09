@@ -1,4 +1,5 @@
 const mongoose = require("mongoose");
+const { randomUUID } = require("crypto");
 
 const saleItemSchema = new mongoose.Schema({
   productId: {
@@ -205,8 +206,20 @@ const saleSchema = new mongoose.Schema(
         type: Boolean,
         default: false,
       },
+      // Money reported by the buyer but not yet acknowledged by the seller.
+      // Keeping this counter on the same document lets payment reservation and
+      // confirmation use one atomic MongoDB update.
+      pendingAmount: {
+        type: Number,
+        default: 0,
+        min: 0,
+      },
       payments: [
         {
+          paymentId: {
+            type: String,
+            default: () => randomUUID(),
+          },
           amount: { type: Number, required: true, min: 0.01 },
           date: { type: Date, default: Date.now },
           method: {
@@ -216,6 +229,12 @@ const saleSchema = new mongoose.Schema(
           },
           recordedBy: { type: String, default: "Admin" },
           notes: { type: String, default: "" },
+          status: {
+            type: String,
+            enum: ["pending", "confirmed"],
+          },
+          confirmedAt: { type: Date, default: null },
+          confirmedBy: { type: String, default: null },
         },
       ],
     },
@@ -282,6 +301,7 @@ const saleSchema = new mongoose.Schema(
 saleSchema.index({ createdAt: -1 });
 saleSchema.index({ paymentType: 1 });
 saleSchema.index({ "creditDetails.fullyPaid": 1 });
+saleSchema.index({ "creditDetails.payments.confirmedAt": 1 });
 saleSchema.index({ "customer.phone": 1 }); // Keep this explicit index
 // REMOVED: saleSchema.index({ saleId: 1 }); ← DUPLICATE of unique: true on saleId
 saleSchema.index({ salesPerson: 1 });
