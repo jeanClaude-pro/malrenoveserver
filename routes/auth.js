@@ -1,6 +1,7 @@
 // routes/auth.js
 const express = require("express");
 const router = express.Router();
+const rateLimit = require("express-rate-limit");
 const User = require("../models/User");
 const bcrypt = require("bcryptjs");
 const generateToken = require("../utils/generateToken");
@@ -12,11 +13,30 @@ function required(...fields) {
   return fields.every((f) => typeof f === "string" && f.trim().length > 0);
 }
 
+// Brute-force protection. Keyed by IP; successful logins don't count against
+// the limit so normal staff usage (occasional typos) isn't penalized.
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  skipSuccessfulRequests: true,
+  message: { message: "Too many login attempts. Please try again later." },
+});
+
+const registerLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  limit: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: "Too many registration attempts. Please try again later." },
+});
+
 function isBcryptHash(value) {
   return typeof value === "string" && /^\$2[aby]\$\d{2}\$/.test(value);
 }
 
-router.post("/register", async (req, res) => {
+router.post("/register", registerLimiter, async (req, res) => {
   try {
     let { username, email, password } = req.body || {};
     username = (username || "").trim();
@@ -43,12 +63,14 @@ router.post("/register", async (req, res) => {
       email,
       password: hashedPassword,
       role: "staff",
-      branchId: "butembo",
+      branchId: null,
+      isActive: false,
+      requiresAssignment: true,
     });
 
     // Keep response minimal for register; client will switch to login
     return res.status(201).json({
-      message: `Welcome ${newUser.username}, you have registered successfully`,
+      message: `Compte créé pour ${newUser.username}. Un Super Admin doit attribuer le rôle et l'agence avant la première connexion.`,
     });
   } catch (error) {
     console.error("Error registering user:", error);
@@ -56,7 +78,7 @@ router.post("/register", async (req, res) => {
   }
 });
 
-router.post("/login", async (req, res) => {
+router.post("/login", loginLimiter, async (req, res) => {
   try {
     let { email, password } = req.body || {};
     email = (email || "").trim().toLowerCase();
@@ -86,6 +108,10 @@ router.post("/login", async (req, res) => {
       return res.status(400).json({ message: "Invalid email or password" });
     }
 
+    if (user.requiresAssignment === true) {
+      return res.status(403).json({ message: "Compte en attente d'affectation par un Super Admin" });
+    }
+
     if (user.isActive === false) {
       return res.status(403).json({ message: "User account is inactive" });
     }
@@ -101,6 +127,7 @@ router.post("/login", async (req, res) => {
       role: user.role,
       branchId: normalizeBranchId(user.branchId),
       isSuperAdmin: user.role === "admin" || user.role === "superadmin",
+      requiresAssignment: user.requiresAssignment === true,
       createdAt: user.createdAt,
       updatedAt: user.updatedAt,
     };

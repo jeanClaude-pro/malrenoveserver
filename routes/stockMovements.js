@@ -17,6 +17,17 @@ function toPositiveInteger(value, fallback = 1) {
   return Math.floor(n);
 }
 
+// Loans/bonuses/manual adjustments are part of the "Articles & stock" module,
+// restricted client-side to manager/inventory_manager (+ super admins). Enforce
+// the same rule server-side so it can't be bypassed by calling the API directly.
+function canManageStock(user) {
+  return Boolean(
+    user?.isSuperAdmin ||
+      user?.role === "manager" ||
+      user?.role === "inventory_manager"
+  );
+}
+
 const ALL_MOVEMENT_TYPES = [
   "loan",
   "loan_return",
@@ -280,6 +291,10 @@ router.get("/", authMiddleware, async (req, res) => {
 /** POST /api/stock-movements – create a loan, bonus, or adjustment */
 router.post("/", authMiddleware, async (req, res) => {
   try {
+    if (!canManageStock(req.user)) {
+      return res.status(403).json({ error: "Accès refusé" });
+    }
+
     const {
       productId,
       type,

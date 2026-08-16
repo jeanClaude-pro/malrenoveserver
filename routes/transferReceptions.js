@@ -583,6 +583,7 @@ router.patch("/:id/void", authMiddleware, async (req, res) => {
     res.json({ success: true, data: voided });
   } catch (error) {
     console.error("Error voiding reception:", error);
+    if (error.name === "CastError") return res.status(400).json({ error: "Invalid ID" });
     res.status(500).json({ error: "Failed to void reception" });
   }
 });

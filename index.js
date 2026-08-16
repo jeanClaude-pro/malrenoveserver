@@ -3,30 +3,72 @@ const express = require("express");
 const mongoose = require("mongoose");
 const cors = require("cors");
 const morgan = require("morgan");
+const helmet = require("helmet");
+const { sanitize: sanitizeMongo } = require("express-mongo-sanitize");
 
 const app = express();
 
+// Behind a reverse proxy (Render, Netlify, etc.) — required for correct
+// req.secure/req.ip and for express-rate-limit to read X-Forwarded-For safely.
+app.set("trust proxy", 1);
+
 // ====== MIDDLEWARE - ORDER MATTERS! ======
+app.use(helmet({
+  // This is a JSON API consumed cross-origin by a separately hosted frontend;
+  // the default same-origin resource policy would block that.
+  crossOriginResourcePolicy: { policy: "cross-origin" },
+}));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 app.use(morgan("combined"));
 
+// Strip any keys starting with "$" or containing "." from body/params/query to
+// prevent NoSQL operator injection. Mutates in place (no reassignment of
+// req.query) so it stays compatible with Express 5's read-only req.query getter.
+app.use((req, res, next) => {
+  if (req.body) sanitizeMongo(req.body);
+  if (req.params) sanitizeMongo(req.params);
+  if (req.query) sanitizeMongo(req.query);
+  next();
+});
+
+// ====== CORS ======
+// CLIENT_URL may be a single origin or a comma-separated list (e.g. a custom
+// domain plus a Netlify preview/staging URL). Local dev origins are always
+// allowed so `npm run dev` keeps working against any backend.
+const configuredOrigins = (process.env.CLIENT_URL || "")
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+const devOrigins = ["http://localhost:5173", "http://localhost:3000"];
+const allowedOrigins = new Set([...configuredOrigins, ...devOrigins]);
+
+if (configuredOrigins.length === 0 && process.env.NODE_ENV === "production") {
+  console.warn("⚠️ CLIENT_URL is not set — only localhost origins will be allowed by CORS.");
+}
+
 app.use(cors({
-  origin: process.env.CLIENT_URL || '*',
+  origin(origin, callback) {
+    // Requests with no Origin header (server-to-server, curl, health checks)
+    if (!origin || allowedOrigins.has(origin)) return callback(null, true);
+    return callback(new Error("Not allowed by CORS"));
+  },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'Idempotency-Key', 'X-Branch-Id']
 }));
 
-// Debug middleware
-app.use((req, res, next) => {
-  if (req.path.includes("/api/auth/login") || req.path.includes("/api/auth/register")) {
-    console.log(`📥 ${req.method} ${req.path}`);
-    console.log("  Content-Type:", req.headers['content-type']);
-    console.log("  Body:", req.body);
-  }
-  next();
-});
+// Force HTTPS in production (proxy-aware; Render terminates TLS upstream).
+// /health is exempt so the hosting provider's internal health checks (which
+// may hit the instance directly over plain HTTP) never get redirected.
+if (process.env.NODE_ENV === "production") {
+  app.use((req, res, next) => {
+    if (req.path === "/health" || req.secure || req.headers["x-forwarded-proto"] === "https") {
+      return next();
+    }
+    return res.redirect(308, `https://${req.headers.host}${req.originalUrl}`);
+  });
+}
 
 // Env variables - CHECK BOTH NAMES!
 const PORT = process.env.PORT || 5000;
@@ -34,8 +76,7 @@ const MONGO_URI = process.env.MONGO_URI || process.env.MONGODB_URI;
 
 console.log("=== ENVIRONMENT VARIABLES CHECK ===");
 console.log("PORT:", PORT);
-console.log("MONGO_URI exists:", !!MONGO_URI);
-console.log("MONGO_URI first 20 chars:", MONGO_URI ? MONGO_URI.substring(0, 20) + "..." : "not set");
+console.log("MONGO_URI configured:", !!MONGO_URI);
 console.log("NODE_ENV:", process.env.NODE_ENV || "development");
 console.log("===================================");
 

@@ -24,6 +24,9 @@ async function authMiddleware(req, res, next) {
     if (!user) {
       return res.status(401).json({ message: "User not found" });
     }
+    if (user.requiresAssignment === true || user.isActive === false) {
+      return res.status(403).json({ message: "User account is pending assignment or inactive" });
+    }
 
     const userId = user._id.toString();
     const superAdmin = isSuperAdmin(user);

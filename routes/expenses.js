@@ -383,9 +383,11 @@ function sanitizeInput(input) {
   return String(input || "").trim();
 }
 
-// Helper to check if user is admin
+// Helper to check if user is admin. Deliberately narrower than "canValidate"
+// (which is also true for managers) — routes gated by this are documented as
+// admin-only (delete any status, edit validated/rejected expenses).
 function isAdminUser(user) {
-  return user && (user.role === 'admin' || user.isAdmin === true || user.canValidate === true);
+  return Boolean(user && user.isSuperAdmin);
 }
 
 // ==================== MAIN EXPENSES ENDPOINT (TIME FRAME PAGINATION) ====================
@@ -1218,6 +1220,9 @@ router.get("/status/:status", authMiddleware, async (req, res) => {
 /** ---------- TEST EMAIL ENDPOINT ---------- **/
 router.get("/test/email", authMiddleware, async (req, res) => {
   try {
+    if (!isAdminUser(req.user)) {
+      return res.status(403).json({ error: "Access denied" });
+    }
     // Create a test expense object
     const testExpense = {
       expenseId: "TEST-001",
@@ -1249,6 +1254,9 @@ router.get("/test/email", authMiddleware, async (req, res) => {
 /** ---------- TEST UPDATE EMAIL ENDPOINT ---------- **/
 router.get("/test/email-update", authMiddleware, async (req, res) => {
   try {
+    if (!isAdminUser(req.user)) {
+      return res.status(403).json({ error: "Access denied" });
+    }
     // Create a test expense object
     const testExpense = {
       expenseId: "TEST-002",
@@ -1282,6 +1290,9 @@ router.get("/test/email-update", authMiddleware, async (req, res) => {
 /** ---------- TEST DELETE EMAIL ENDPOINT ---------- **/
 router.get("/test/email-delete", authMiddleware, async (req, res) => {
   try {
+    if (!isAdminUser(req.user)) {
+      return res.status(403).json({ error: "Access denied" });
+    }
     // Create a test expense info object
     const testExpenseInfo = {
       id: "test_id_123",

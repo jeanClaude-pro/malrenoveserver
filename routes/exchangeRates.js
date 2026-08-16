@@ -4,7 +4,7 @@ const ExchangeRate = require("../models/ExchangeRate");
 const authMiddleware = require("../middleware/auth");
 
 // GET current active exchange rate
-router.get("/current", async (req, res) => {
+router.get("/current", authMiddleware, async (req, res) => {
   try {
     const currentRate = await ExchangeRate.getCurrentRate();
     
@@ -30,7 +30,7 @@ router.get("/current", async (req, res) => {
 router.get("/history", authMiddleware, async (req, res) => {
   try {
     // Check if user is admin
-    if (req.user.role !== "admin" && req.user.role !== "manager") {
+    if (!req.user.isSuperAdmin && req.user.role !== "manager") {
       return res.status(403).json({ 
         error: "Only admins and managers can view rate history" 
       });
@@ -53,7 +53,7 @@ router.get("/history", authMiddleware, async (req, res) => {
 router.post("/", authMiddleware, async (req, res) => {
   try {
     // Check if user is admin
-    if (req.user.role !== "admin" && req.user.role !== "manager") {
+    if (!req.user.isSuperAdmin && req.user.role !== "manager") {
       return res.status(403).json({ 
         error: "Only admins and managers can set exchange rates" 
       });
@@ -104,7 +104,7 @@ router.post("/", authMiddleware, async (req, res) => {
 router.put("/:id", authMiddleware, async (req, res) => {
   try {
     // Check if user is admin
-    if (req.user.role !== "admin" && req.user.role !== "manager") {
+    if (!req.user.isSuperAdmin && req.user.role !== "manager") {
       return res.status(403).json({ 
         error: "Only admins and managers can update exchange rates" 
       });
@@ -155,7 +155,7 @@ router.put("/:id", authMiddleware, async (req, res) => {
 router.patch("/:id/deactivate", authMiddleware, async (req, res) => {
   try {
     // Check if user is admin
-    if (req.user.role !== "admin" && req.user.role !== "manager") {
+    if (!req.user.isSuperAdmin && req.user.role !== "manager") {
       return res.status(403).json({ 
         error: "Only admins and managers can deactivate exchange rates" 
       });

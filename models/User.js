@@ -28,6 +28,11 @@ const userSchema = new mongoose.Schema(
       enum: ["butembo", "beni"],
       default: "butembo",
     },
+    requiresAssignment: {
+      type: Boolean,
+      default: false,
+      index: true,
+    },
     isActive: {
       type: Boolean,
       default: true,

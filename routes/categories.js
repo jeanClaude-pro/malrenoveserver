@@ -2,6 +2,7 @@ const express = require("express");
 const router = express.Router();
 
 const Category = require("../models/Category");
+const authMiddleware = require("../middleware/auth");
 
 const normalizeCategory = (item) => ({
   name: typeof item?.name === "string" ? item.name.trim() : "",
@@ -9,9 +10,22 @@ const normalizeCategory = (item) => ({
     typeof item?.description === "string" ? item.description.trim() : "",
 });
 
+router.use(authMiddleware);
+
+function canManageCategories(user) {
+  return Boolean(
+    user?.isSuperAdmin ||
+      user?.role === "manager" ||
+      user?.role === "inventory_manager"
+  );
+}
+
 // Create a new category
 router.post("/", async (req, res) => {
   try {
+    if (!canManageCategories(req.user)) {
+      return res.status(403).json({ message: "Access denied" });
+    }
     const payload = req.body;
     const items = Array.isArray(payload) ? payload : [payload];
 

@@ -95,6 +95,13 @@ router.patch("/:id/pay", authMiddleware, async (req, res) => {
       return res.status(404).json({ error: "Loan not found" });
     }
 
+    const remaining = Number(loan.amount) - Number(loan.amountPaid || 0);
+    if (payment > remaining + 0.01) {
+      return res.status(400).json({
+        error: `Le paiement dépasse le solde restant (${remaining.toFixed(2)})`,
+      });
+    }
+
     loan.amountPaid += payment;
     loan.status = loan.amountPaid >= loan.amount ? "paid" : "partial";
 
@@ -112,6 +119,10 @@ router.patch("/:id/pay", authMiddleware, async (req, res) => {
 /** ---------- DELETE LOAN ---------- **/
 router.delete("/:id", authMiddleware, async (req, res) => {
   try {
+    if (!req.user.isSuperAdmin) {
+      return res.status(403).json({ error: "Seuls les administrateurs peuvent supprimer un prêt" });
+    }
+
     const loan = await Loan.findOneAndDelete(scopedFilter({ _id: req.params.id }, req.branchId));
     if (!loan) {
       return res.status(404).json({ error: "Loan not found" });
