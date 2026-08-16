@@ -1,6 +1,12 @@
 const mongoose = require("mongoose");
 
 const expenseSchema = new mongoose.Schema({
+  branchId: {
+    type: String,
+    enum: ["butembo", "beni"],
+    default: "butembo",
+    index: true,
+  },
   expenseId: {
     type: String,
     required: true,

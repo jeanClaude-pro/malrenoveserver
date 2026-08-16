@@ -7,6 +7,7 @@ const Product = require("../models/Product");
 const StockMovement = require("../models/StockMovement");
 const TransferReception = require("../models/TransferReception");
 const authMiddleware = require("../middleware/auth");
+const { scopedFilter, getBranchStock, adjustBranchStock } = require("../utils/branchContext");
 
 // Helper function to generate a unique transfer ID
 function generateTransferId() {
@@ -73,10 +74,10 @@ function computeTotalPieces(product) {
 // reception in transferReceptions.js. This is a read-only sanity check so users
 // can't create a transfer for more than what's currently on hand; it does not
 // reserve or deduct anything.
-async function hasEnoughStock(productId, totalPieces) {
+async function hasEnoughStock(productId, totalPieces, branchId) {
   if (!productId || totalPieces <= 0) return true;
   const product = await Product.findById(productId).lean();
-  return !!product && Number(product.stock || 0) >= totalPieces;
+  return !!product && getBranchStock(product, branchId) >= totalPieces;
 }
 
 // ==================== GET ALL TRANSFERS (with filters) ====================
@@ -112,7 +113,7 @@ router.get("/", authMiddleware, async (req, res) => {
       ];
     }
 
-    const transfers = await Transfer.find(filter).sort({ createdAt: -1 }).lean();
+    const transfers = await Transfer.find(scopedFilter(filter, req.branchId)).sort({ createdAt: -1 }).lean();
 
     const summary = {
       total: transfers.length,
@@ -138,7 +139,7 @@ router.get("/", authMiddleware, async (req, res) => {
 // ==================== GET SINGLE TRANSFER ====================
 router.get("/:id", authMiddleware, async (req, res) => {
   try {
-    const transfer = await Transfer.findById(req.params.id).lean();
+    const transfer = await Transfer.findOne(scopedFilter({ _id: req.params.id }, req.branchId)).lean();
 
     if (!transfer) {
       return res.status(404).json({ error: "Transfer not found" });
@@ -202,7 +203,7 @@ router.post("/", authMiddleware, async (req, res) => {
 
     // Advisory only — creating a transfer never touches inventory itself, but we
     // still warn if the requested quantity exceeds what's currently on hand.
-    if (!(await hasEnoughStock(product.productId, totalPieces))) {
+    if (!(await hasEnoughStock(product.productId, totalPieces, req.branchId))) {
       return res.status(409).json({
         error: `Insufficient stock for "${product.name}" to create this transfer.`,
       });
@@ -214,6 +215,7 @@ router.post("/", authMiddleware, async (req, res) => {
       if (!isNaN(opDate.getTime()) && opDate <= new Date()) customCreatedAt = opDate;
     }
     const transfer = new Transfer({
+      branchId: req.branchId,
       transferId: generateTransferId(),
       product: {
         productId: product.productId,
@@ -278,7 +280,7 @@ router.patch("/:id/status", authMiddleware, async (req, res) => {
       });
     }
 
-    const transfer = await Transfer.findById(id);
+    const transfer = await Transfer.findOne(scopedFilter({ _id: id }, req.branchId));
     if (!transfer) {
       return res.status(404).json({ error: "Transfer not found" });
     }
@@ -291,10 +293,10 @@ router.patch("/:id/status", authMiddleware, async (req, res) => {
     // that reception from reality, so require voiding the reception first instead
     // of silently reverting the transfer underneath it.
     if (status !== oldStatus && oldStatus === "delivered") {
-      const linkedReception = await TransferReception.findOne({
+      const linkedReception = await TransferReception.findOne(scopedFilter({
         transferId: transfer._id,
         status: "active",
-      }).lean();
+      }, req.branchId)).lean();
       if (linkedReception) {
         return res.status(409).json({
           error: `This transfer was already received (reception ${linkedReception.receptionId}). Void that reception first if you need to change this transfer's status.`,
@@ -346,7 +348,7 @@ router.patch("/:id/confirm-delivery", authMiddleware, async (req, res) => {
     let deliveredTransfer;
     let remainingStock;
     await session.withTransaction(async () => {
-      const transfer = await Transfer.findById(id).session(session);
+      const transfer = await Transfer.findOne(scopedFilter({ _id: id }, req.branchId)).session(session);
       if (!transfer) {
         const error = new Error("Transfer not found");
         error.status = 404;
@@ -376,15 +378,18 @@ router.patch("/:id/confirm-delivery", authMiddleware, async (req, res) => {
       }
 
       // The stock predicate makes the subtraction safe even if two requests race.
-      const product = await Product.findOneAndUpdate(
-        { _id: transfer.product.productId, status: "active", stock: { $gte: quantity } },
-        { $inc: { stock: -quantity } },
-        { new: true, session }
-      );
+      const current = await Product.findById(transfer.product.productId).session(session).lean();
+      const previousStock = getBranchStock(current, req.branchId);
+      const product = current?.status === "active" ? await adjustBranchStock({
+        productId: transfer.product.productId,
+        branchId: req.branchId,
+        delta: -quantity,
+        requireAvailable: true,
+        session,
+      }) : null;
       if (!product) {
-        const current = await Product.findById(transfer.product.productId).session(session).lean();
         const error = new Error(current
-          ? `Insufficient stock for "${transfer.product.name}". Available: ${current.stock}, required: ${quantity}`
+          ? `Insufficient stock for "${transfer.product.name}". Available: ${previousStock}, required: ${quantity}`
           : "The linked inventory product was not found or is inactive");
         error.status = 409;
         throw error;
@@ -418,10 +423,14 @@ router.patch("/:id/confirm-delivery", authMiddleware, async (req, res) => {
         notes: `Transfert livré à ${transfer.destinationAgency}${reason ? ` — ${reason}` : ""}`,
         recordedBy: confirmedBy,
         recordedByUserId: req.user.userId,
+        recordedByRole: req.user.role,
+        branchId: req.branchId,
+        previousStock,
+        newStock: previousStock - quantity,
       }], { session });
 
       deliveredTransfer = transfer;
-      remainingStock = product.stock;
+      remainingStock = getBranchStock(product, req.branchId);
     });
 
     res.json({
@@ -455,16 +464,16 @@ router.put("/:id", authMiddleware, async (req, res) => {
       reason,
     } = req.body;
 
-    const transfer = await Transfer.findById(id);
+    const transfer = await Transfer.findOne(scopedFilter({ _id: id }, req.branchId));
     if (!transfer) {
       return res.status(404).json({ error: "Transfer not found" });
     }
 
     if (transfer.status === "delivered" && product) {
-      const linkedReception = await TransferReception.findOne({
+      const linkedReception = await TransferReception.findOne(scopedFilter({
         transferId: transfer._id,
         status: "active",
-      }).lean();
+      }, req.branchId)).lean();
       if (linkedReception) {
         return res.status(409).json({
           error: `This transfer was already received (reception ${linkedReception.receptionId}). Void that reception first if you need to change the product or quantity.`,
@@ -500,7 +509,7 @@ router.put("/:id", authMiddleware, async (req, res) => {
       // Advisory only — editing a transfer never touches inventory itself (only a
       // confirmed reception does), but warn if the new quantity exceeds current stock.
       if ((productChanged || quantityChanged) && newProductId) {
-        if (!(await hasEnoughStock(newProductId, newTotalPieces))) {
+        if (!(await hasEnoughStock(newProductId, newTotalPieces, req.branchId))) {
           return res.status(409).json({
             error: `Insufficient stock for "${product.name || transfer.product.name}" to apply this change.`,
           });
@@ -580,20 +589,20 @@ router.put("/:id", authMiddleware, async (req, res) => {
 // ==================== DELETE TRANSFER ====================
 router.delete("/:id", authMiddleware, async (req, res) => {
   try {
-    if (req.user.role !== "admin") {
+    if (!req.user.isSuperAdmin) {
       return res.status(403).json({ error: "Only admins can delete transfers" });
     }
 
-    const transfer = await Transfer.findById(req.params.id);
+    const transfer = await Transfer.findOne(scopedFilter({ _id: req.params.id }, req.branchId));
     if (!transfer) {
       return res.status(404).json({ error: "Transfer not found" });
     }
 
     if (transfer.status === "delivered") {
-      const linkedReception = await TransferReception.findOne({
+      const linkedReception = await TransferReception.findOne(scopedFilter({
         transferId: transfer._id,
         status: "active",
-      }).lean();
+      }, req.branchId)).lean();
       if (linkedReception) {
         return res.status(409).json({
           error: `This transfer was already received (reception ${linkedReception.receptionId}). Void that reception first — deleting the transfer would orphan its reception history.`,

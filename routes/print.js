@@ -2,6 +2,10 @@ const express = require('express');
 const escpos = require('escpos');
 escpos.USB = require('escpos-usb');
 const router = express.Router();
+const authMiddleware = require('../middleware/auth');
+const COMPANY_NAME = 'Entre Nous Renove';
+
+router.use(authMiddleware);
 
 // Find and use the first available USB printer
 function getPrinter() {
@@ -56,9 +60,8 @@ router.post('/receipt', async (req, res) => {
           .align('ct')
           .style('b')
           .size(2, 2)
-          .text('ETS. DIEU MERCI')
+          .text(COMPANY_NAME)
           .size(1, 1)
-          .text('_Chez Dan Collection_')
           .align('lt')
           .text(receiptData.shopAddress)
           .text(`RCCM: ${receiptData.shopRegistration}`)
@@ -172,8 +175,7 @@ router.post('/stub', async (req, res) => {
           .style('b')
           .size(1, 1)
           .text('SOUCHE')
-          .text('ETS. DIEU MERCI')
-          .text('_Chez Dan Collection_')
+          .text(COMPANY_NAME)
           .align('lt')
           .text(`Date: ${receiptData.date}`)
           .text(`Reçu #: ${receiptData.receiptNumber}`)

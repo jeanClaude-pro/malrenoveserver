@@ -4,12 +4,220 @@ const mongoose = require("mongoose");
 const StockMovement = require("../models/StockMovement");
 const Product = require("../models/Product");
 const authMiddleware = require("../middleware/auth");
+const {
+  BRANCHES,
+  scopedFilter,
+  getBranchStock,
+  adjustBranchStock,
+} = require("../utils/branchContext");
 
 function toPositiveInteger(value, fallback = 1) {
   const n = Number(value);
   if (!Number.isFinite(n) || n < 1) return fallback;
   return Math.floor(n);
 }
+
+const ALL_MOVEMENT_TYPES = [
+  "loan",
+  "loan_return",
+  "bonus_manual",
+  "adjustment_in",
+  "adjustment_out",
+  "car_arrival",
+  "transfer_out",
+  "sale",
+  "reception",
+];
+
+// Types that reduce Product.stock — everything else in ALL_MOVEMENT_TYPES increases it.
+const DECREASE_TYPES = new Set(["loan", "bonus_manual", "adjustment_out", "transfer_out", "sale"]);
+
+const MOVEMENT_LABELS = {
+  loan: "Prêt",
+  loan_return: "Retour de prêt",
+  bonus_manual: "Bonus manuel",
+  adjustment_in: "Ajustement (+)",
+  adjustment_out: "Ajustement (-)",
+  car_arrival: "Arrivée de camion",
+  transfer_out: "Transfert livré",
+  sale: "Vente",
+  reception: "Réception de transfert",
+};
+
+const MOVEMENT_SOURCES = {
+  loan: "Prêt",
+  loan_return: "Prêt",
+  bonus_manual: "Ajustement manuel",
+  adjustment_in: "Ajustement manuel",
+  adjustment_out: "Ajustement manuel",
+  car_arrival: "Camion / Trajet",
+  transfer_out: "Transfert",
+  sale: "Vente",
+  reception: "Transfert",
+};
+
+function signedQuantity(movement) {
+  return DECREASE_TYPES.has(movement.type) ? -movement.quantity : movement.quantity;
+}
+
+// Resolves { start, end } for the Fiche de Stock period selector: today / week / month / custom.
+function resolveLedgerPeriod(query) {
+  const { range, from, to } = query;
+  const now = new Date();
+
+  if (range === "custom" || (!range && (from || to))) {
+    if (!from || !to) {
+      throw Object.assign(new Error("Les dates 'from' et 'to' sont requises pour une période personnalisée"), { status: 400 });
+    }
+    const start = new Date(from);
+    const end = new Date(to);
+    if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) {
+      throw Object.assign(new Error("Format de date invalide"), { status: 400 });
+    }
+    start.setHours(0, 0, 0, 0);
+    end.setHours(23, 59, 59, 999);
+    if (start > end) {
+      throw Object.assign(new Error("La date de début doit précéder la date de fin"), { status: 400 });
+    }
+    return { start, end, label: "custom" };
+  }
+
+  if (range === "week") {
+    const day = now.getDay();
+    const mondayOffset = day === 0 ? -6 : 1 - day;
+    const start = new Date(now);
+    start.setDate(now.getDate() + mondayOffset);
+    start.setHours(0, 0, 0, 0);
+    const end = new Date(start);
+    end.setDate(start.getDate() + 6);
+    end.setHours(23, 59, 59, 999);
+    return { start, end, label: "week" };
+  }
+
+  if (range === "month") {
+    const start = new Date(now.getFullYear(), now.getMonth(), 1);
+    const end = new Date(now.getFullYear(), now.getMonth() + 1, 0);
+    end.setHours(23, 59, 59, 999);
+    return { start, end, label: "month" };
+  }
+
+  // Default: today
+  const start = new Date(now);
+  start.setHours(0, 0, 0, 0);
+  const end = new Date(now);
+  end.setHours(23, 59, 59, 999);
+  return { start, end, label: "today" };
+}
+
+/**
+ * GET /api/stock-movements/ledger/:productId?range=today|week|month|custom&from=&to=
+ *
+ * The single reliable Fiche de Stock calculation: starting/ending inventory for the
+ * period plus the full, period-scoped audit trail. Both the UI and the PDF export
+ * must call this endpoint and render its numbers verbatim — never recompute locally.
+ */
+router.get("/ledger/:productId", authMiddleware, async (req, res) => {
+  try {
+    const { productId } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(productId)) {
+      return res.status(400).json({ error: "productId invalide" });
+    }
+
+    let period;
+    try {
+      period = resolveLedgerPeriod(req.query);
+    } catch (periodError) {
+      return res.status(periodError.status || 400).json({ error: periodError.message });
+    }
+
+    const product = await Product.findById(productId).lean();
+    if (!product) {
+      return res.status(404).json({ error: "Article non trouvé" });
+    }
+
+    const currentStock = getBranchStock(product, req.branchId);
+
+    // Every movement from the period start onward (no upper bound) — needed to walk
+    // both the starting-of-period balance and the ending-of-period balance back from
+    // the current, authoritative stock figure.
+    const movements = await StockMovement.find(scopedFilter({
+      productId,
+      createdAt: { $gte: period.start },
+    }, req.branchId))
+      .sort({ createdAt: 1 })
+      .lean();
+
+    let sumFromStart = 0;
+    let sumAfterEnd = 0;
+    for (const movement of movements) {
+      const signed = signedQuantity(movement);
+      sumFromStart += signed;
+      if (movement.createdAt > period.end) sumAfterEnd += signed;
+    }
+
+    const startingStock = currentStock - sumFromStart;
+    const endingStock = currentStock - sumAfterEnd;
+
+    let running = startingStock;
+    let added = 0;
+    let removed = 0;
+    const actions = [];
+    for (const movement of movements) {
+      if (movement.createdAt > period.end) continue;
+      const signed = signedQuantity(movement);
+      const previousStock = running;
+      running += signed;
+      if (signed > 0) added += signed;
+      else removed += -signed;
+      actions.push({
+        id: movement._id,
+        date: movement.createdAt,
+        type: movement.type,
+        label: MOVEMENT_LABELS[movement.type] || movement.type,
+        source: MOVEMENT_SOURCES[movement.type] || movement.type,
+        reference: movement.reference || "",
+        previousStock,
+        change: signed,
+        newStock: running,
+        performedBy: movement.recordedBy || "Inconnu",
+        performedByRole: movement.recordedByRole || "",
+        branchId: req.branchId,
+        reason: movement.notes || "",
+      });
+    }
+    actions.reverse(); // most recent first, matching every other history view in the app
+
+    res.json({
+      success: true,
+      branch: BRANCHES.find((branch) => branch.id === req.branchId),
+      product: {
+        _id: product._id,
+        name: product.name,
+        status: product.status,
+        category: product.category,
+        piecesPerCarton: product.piecesPerCarton || 1,
+        currentStock,
+      },
+      period: {
+        range: period.label,
+        start: period.start.toISOString(),
+        end: period.end.toISOString(),
+      },
+      summary: {
+        startingStock,
+        added,
+        removed,
+        endingStock,
+        currentStock,
+        actionsCount: actions.length,
+      },
+      actions,
+    });
+  } catch (error) {
+    console.error("Error building stock ledger:", error);
+    res.status(500).json({ error: "Échec du calcul de la fiche de stock" });
+  }
+});
 
 /** GET /api/stock-movements?productId=xxx&type=loan&from=YYYY-MM-DD&to=YYYY-MM-DD */
 router.get("/", authMiddleware, async (req, res) => {
@@ -26,9 +234,8 @@ router.get("/", authMiddleware, async (req, res) => {
     }
 
     if (type) {
-      const validTypes = ["loan", "loan_return", "bonus_manual", "adjustment_in", "adjustment_out", "car_arrival", "transfer_out"];
-      if (!validTypes.includes(type)) {
-        return res.status(400).json({ error: `Type invalide. Valeurs: ${validTypes.join(", ")}` });
+      if (!ALL_MOVEMENT_TYPES.includes(type)) {
+        return res.status(400).json({ error: `Type invalide. Valeurs: ${ALL_MOVEMENT_TYPES.join(", ")}` });
       }
       filter.type = type;
     }
@@ -51,7 +258,7 @@ router.get("/", authMiddleware, async (req, res) => {
       }
     }
 
-    const movements = await StockMovement.find(filter)
+    const movements = await StockMovement.find(scopedFilter(filter, req.branchId))
       .sort({ createdAt: -1 })
       .lean();
 
@@ -109,20 +316,22 @@ router.post("/", authMiddleware, async (req, res) => {
       return res.status(400).json({ error: "Impossible de créer un mouvement pour un article inactif" });
     }
 
+    const previousStock = getBranchStock(product, req.branchId);
     // For loan and bonus_manual and adjustment_out, deduct from stock
     const decreasesStock = ["loan", "bonus_manual", "adjustment_out"].includes(type);
     // adjustment_in increases stock
 
     if (decreasesStock) {
-      if (product.stock < qty) {
+      if (previousStock < qty) {
         return res.status(400).json({
-          error: `Stock insuffisant pour "${product.name}". Disponible: ${product.stock}`,
+          error: `Stock insuffisant pour "${product.name}". Disponible: ${previousStock}`,
         });
       }
-      await Product.findByIdAndUpdate(productId, { $inc: { stock: -qty } });
+      const updated = await adjustBranchStock({ productId, branchId: req.branchId, delta: -qty, requireAvailable: true });
+      if (!updated) return res.status(409).json({ error: "Le stock a changé; veuillez réessayer" });
     } else {
       // adjustment_in
-      await Product.findByIdAndUpdate(productId, { $inc: { stock: qty } });
+      await adjustBranchStock({ productId, branchId: req.branchId, delta: qty });
     }
 
     const movement = new StockMovement({
@@ -137,6 +346,10 @@ router.post("/", authMiddleware, async (req, res) => {
       notes: notes?.trim() || "",
       recordedBy: req.user.username || req.user.userId,
       recordedByUserId: req.user.userId,
+      recordedByRole: req.user.role,
+      branchId: req.branchId,
+      previousStock,
+      newStock: previousStock + (decreasesStock ? -qty : qty),
     });
 
     const saved = await movement.save();
@@ -161,7 +374,7 @@ router.patch("/:id/mark-loan-paid", authMiddleware, async (req, res) => {
       return res.status(400).json({ error: "ID invalide" });
     }
 
-    const movement = await StockMovement.findById(id).lean();
+    const movement = await StockMovement.findOne(scopedFilter({ _id: id }, req.branchId)).lean();
     if (!movement) {
       return res.status(404).json({ error: "Mouvement non trouvé" });
     }
@@ -174,8 +387,8 @@ router.patch("/:id/mark-loan-paid", authMiddleware, async (req, res) => {
       return res.status(400).json({ error: "Ce prêt est déjà marqué comme payé" });
     }
 
-    const updated = await StockMovement.findByIdAndUpdate(
-      id,
+    const updated = await StockMovement.findOneAndUpdate(
+      scopedFilter({ _id: id }, req.branchId),
       {
         loanPaid: true,
         loanPaidAt: new Date(),
@@ -194,7 +407,7 @@ router.patch("/:id/mark-loan-paid", authMiddleware, async (req, res) => {
 /** DELETE /api/stock-movements/:id – admin only; reverses stock change */
 router.delete("/:id", authMiddleware, async (req, res) => {
   try {
-    if (req.user.role !== "admin") {
+    if (!req.user.isSuperAdmin) {
       return res.status(403).json({ error: "Seuls les administrateurs peuvent supprimer des mouvements" });
     }
 
@@ -203,7 +416,7 @@ router.delete("/:id", authMiddleware, async (req, res) => {
       return res.status(400).json({ error: "ID invalide" });
     }
 
-    const movement = await StockMovement.findById(id).lean();
+    const movement = await StockMovement.findOne(scopedFilter({ _id: id }, req.branchId)).lean();
     if (!movement) {
       return res.status(404).json({ error: "Mouvement non trouvé" });
     }
@@ -211,14 +424,13 @@ router.delete("/:id", authMiddleware, async (req, res) => {
     // Reverse the stock change
     const decreasedStock = ["loan", "bonus_manual", "adjustment_out"].includes(movement.type);
     if (decreasedStock) {
-      await Product.findByIdAndUpdate(movement.productId, { $inc: { stock: movement.quantity } });
+      await adjustBranchStock({ productId: movement.productId, branchId: req.branchId, delta: movement.quantity });
     } else {
-      await Product.findByIdAndUpdate(movement.productId, {
-        $inc: { stock: -movement.quantity },
-      });
+      const updated = await adjustBranchStock({ productId: movement.productId, branchId: req.branchId, delta: -movement.quantity, requireAvailable: true });
+      if (!updated) return res.status(409).json({ error: "Stock insuffisant pour annuler ce mouvement" });
     }
 
-    await StockMovement.findByIdAndDelete(id);
+    await StockMovement.deleteOne(scopedFilter({ _id: id }, req.branchId));
 
     res.json({ success: true, message: "Mouvement supprimé et stock corrigé" });
   } catch (error) {

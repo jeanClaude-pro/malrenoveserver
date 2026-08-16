@@ -7,7 +7,14 @@ const Sale = require("../models/Sale");
 const Customer = require("../models/Customer");
 const Product = require("../models/Product");
 const ExchangeRate = require("../models/ExchangeRate");
+const StockMovement = require("../models/StockMovement");
 const authMiddleware = require("../middleware/auth");
+const {
+  branchScope,
+  scopedFilter,
+  getBranchStock,
+  adjustBranchStock,
+} = require("../utils/branchContext");
 
 // normalize to the Sale model enum
 function normalizePaymentMethod(pm) {
@@ -96,7 +103,7 @@ const VALID_REVENUE_STATUS_FILTER = {
 // Revenue is cash actually received: immediate-payment sales at sale time, plus
 // credit payments at the time the seller confirms receipt. Credit invoices are
 // deliberately absent until that confirmation happens.
-async function getReceivedRevenue(createdAt, scope = {}) {
+async function getReceivedRevenue(createdAt, scope = {}, branchId = "butembo") {
   const validSaleMatch = {
     $and: [
       {
@@ -104,6 +111,7 @@ async function getReceivedRevenue(createdAt, scope = {}) {
         type: { $in: ["sale", "reservation"] },
       },
       scope,
+      branchScope(branchId),
     ],
   };
 
@@ -175,17 +183,43 @@ async function getReceivedRevenue(createdAt, scope = {}) {
 }
 
 // Helper function to update customer data (FIXED)
-async function updateCustomerData(customerData, saleTotal) {
+async function updateCustomerData(customerData, saleTotal, branchId) {
   const { name, phone, email } = customerData;
   const now = new Date();
   try {
     let customer = await Customer.findOne({ phone });
     if (customer) {
+      if (branchId !== "butembo" && !customer.branchStats?.get("butembo")) {
+        customer.branchStats = customer.branchStats || new Map();
+        customer.branchStats.set("butembo", {
+          totalPurchases: Number(customer.totalPurchases || 0),
+          totalSpent: Number(customer.totalSpent || 0),
+          firstPurchaseDate: customer.firstPurchaseDate || null,
+          lastPurchaseDate: customer.lastPurchaseDate || null,
+        });
+      }
       customer.totalPurchases += 1;
       customer.totalSpent += parseFloat(saleTotal);
       customer.lastPurchaseDate = now;
       if (name && customer.name !== name) customer.name = name;
       if (email && customer.email !== email) customer.email = email;
+      customer.branches = Array.from(new Set([...(customer.branches || ["butembo"]), branchId]));
+      const previousBranchStats = customer.branchStats?.get(branchId) || (branchId === "butembo" ? {
+        totalPurchases: Number(customer.totalPurchases || 0) - 1,
+        totalSpent: Number(customer.totalSpent || 0) - parseFloat(saleTotal),
+        firstPurchaseDate: customer.firstPurchaseDate || now,
+      } : {
+        totalPurchases: 0,
+        totalSpent: 0,
+        firstPurchaseDate: now,
+      });
+      customer.branchStats = customer.branchStats || new Map();
+      customer.branchStats.set(branchId, {
+        totalPurchases: Number(previousBranchStats.totalPurchases || 0) + 1,
+        totalSpent: Number(previousBranchStats.totalSpent || 0) + parseFloat(saleTotal),
+        firstPurchaseDate: previousBranchStats.firstPurchaseDate || now,
+        lastPurchaseDate: now,
+      });
     } else {
       customer = new Customer({
         name,
@@ -195,6 +229,10 @@ async function updateCustomerData(customerData, saleTotal) {
         totalSpent: parseFloat(saleTotal),
         firstPurchaseDate: now,
         lastPurchaseDate: now,
+        branches: [branchId],
+        branchStats: {
+          [branchId]: { totalPurchases: 1, totalSpent: parseFloat(saleTotal), firstPurchaseDate: now, lastPurchaseDate: now },
+        },
       });
     }
     await customer.save();
@@ -208,13 +246,13 @@ async function updateCustomerData(customerData, saleTotal) {
 }
 
 // Helper function to recalculate customer statistics (FIXED)
-async function recalculateCustomerStats(customerId) {
+async function recalculateCustomerStats(customerId, branchId) {
   try {
     // FIX: Only include completed sales (exclude voided and corrected)
-    const sales = await Sale.find({ 
+    const sales = await Sale.find(scopedFilter({
       customerId: customerId,
       status: { $in: ["completed", "pending", undefined, null] } // Only valid sales
-    })
+    }, branchId))
     .sort({ createdAt: 1 })
     .select('total status type createdAt') // Only select needed fields
     .lean();
@@ -225,12 +263,9 @@ async function recalculateCustomerStats(customerId) {
     );
     
     if (validSales.length === 0) {
-      await Customer.findByIdAndUpdate(customerId, {
-        totalPurchases: 0,
-        totalSpent: 0,
-        firstPurchaseDate: null,
-        lastPurchaseDate: null,
-      });
+      await Customer.findByIdAndUpdate(customerId, { $set: { [`branchStats.${branchId}`]: {
+        totalPurchases: 0, totalSpent: 0, firstPurchaseDate: null, lastPurchaseDate: null,
+      } } });
       return;
     }
     
@@ -240,10 +275,7 @@ async function recalculateCustomerStats(customerId) {
     const lastPurchaseDate = validSales[validSales.length - 1].createdAt;
 
     await Customer.findByIdAndUpdate(customerId, {
-      totalPurchases,
-      totalSpent,
-      firstPurchaseDate,
-      lastPurchaseDate,
+      $set: { [`branchStats.${branchId}`]: { totalPurchases, totalSpent, firstPurchaseDate, lastPurchaseDate } },
     });
   } catch (error) {
     console.error("Error recalculating customer stats:", error);
@@ -449,7 +481,7 @@ router.get("/", authMiddleware, async (req, res) => {
     }
     
     // Execute query - get ALL records within timeframe (no skip/limit)
-    const sales = await Sale.find(filter)
+    const sales = await Sale.find(scopedFilter(filter, req.branchId))
       .select('-__v') // Exclude version key
       .sort({ createdAt: -1 }) // Newest first as requested
       .lean();
@@ -483,7 +515,8 @@ router.get("/", authMiddleware, async (req, res) => {
     };
     const receivedRevenue = await getReceivedRevenue(
       timeframeFilter.createdAt,
-      revenueScope
+      revenueScope,
+      req.branchId
     );
     
     // Prepare response with timeframe metadata
@@ -555,13 +588,13 @@ router.get("/", authMiddleware, async (req, res) => {
 /** ---------- ALL OUTSTANDING CREDIT SALES (not restricted by sale date) ---------- **/
 router.get("/unpaid", authMiddleware, async (req, res) => {
   try {
-    const sales = await Sale.find({
+    const sales = await Sale.find(scopedFilter({
       paymentType: "credit",
       "creditDetails.fullyPaid": false,
       "creditDetails.amountDue": { $gt: 0 },
       status: { $nin: ["voided", "corrected", "refunded"] },
       type: { $in: ["sale", "reservation"] },
-    })
+    }, req.branchId))
       .select("-__v")
       .sort({ "creditDetails.dueDate": 1, createdAt: 1 })
       .lean();
@@ -597,13 +630,13 @@ router.get("/stats/daily", authMiddleware, async (req, res) => {
 
     const dailySales = await Sale.aggregate([
       {
-        $match: {
+        $match: scopedFilter({
           createdAt: { $gte: startOfDay, $lte: endOfDay },
           // ✅ FIXED: INCLUDE PENDING RESERVATIONS (money already received)
           status: { $in: ["completed", "pending"] },
           // ✅ FIXED: INCLUDE BOTH SALES AND RESERVATIONS
           type: { $in: ["sale", "reservation"] }
-        },
+        }, req.branchId),
       },
       {
         $group: {
@@ -615,11 +648,11 @@ router.get("/stats/daily", authMiddleware, async (req, res) => {
     ]);
 
     // Use timeframe-based query (no limit) for consistency
-    const sales = await Sale.find({
+    const sales = await Sale.find(scopedFilter({
       createdAt: { $gte: startOfDay, $lte: endOfDay },
       status: { $in: ["completed", "pending"] },
       type: { $in: ["sale", "reservation"] }
-    })
+    }, req.branchId))
     .sort({ createdAt: -1 })
     .select('-__v')
     .lean();
@@ -627,7 +660,7 @@ router.get("/stats/daily", authMiddleware, async (req, res) => {
     const receivedRevenue = await getReceivedRevenue({
       $gte: startOfDay,
       $lte: endOfDay,
-    });
+    }, {}, req.branchId);
 
     res.json({
       date: targetDate.toISOString().split("T")[0],
@@ -680,7 +713,7 @@ router.post("/", authMiddleware, async (req, res) => {
     // CompanyReport, etc.) — the time-of-day is kept as "now" so ordering within
     // the day stays chronological.
     let customCreatedAt = null;
-    if (saleDate && req.user?.role === "admin") {
+    if (saleDate && req.user?.isSuperAdmin) {
       const datePart = String(saleDate).slice(0, 10);
       const now = new Date();
       const timeOfDay = [
@@ -717,6 +750,7 @@ router.post("/", authMiddleware, async (req, res) => {
       const saleNumber = `EXP-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
 
       const expenseData = {
+        branchId: req.branchId,
         saleId,
         saleNumber,
         customer: {
@@ -729,7 +763,7 @@ router.post("/", authMiddleware, async (req, res) => {
         total: expenseAmount,
         paymentMethod: normalizedPM,
         status: "expense", // 🔹 Special status for expenses
-        salesPerson: recordedBy || salesPerson || "Admin",
+        salesPerson: req.user.username || req.user.name || "Unknown",
         type: "expense",
         reason: reason,
         recipientName: recipientName,
@@ -808,11 +842,12 @@ router.post("/", authMiddleware, async (req, res) => {
         });
       }
 
-      if (typeof product.stock !== "number" || product.stock < quantity) {
+      const availableStock = getBranchStock(product, req.branchId);
+      if (availableStock < quantity) {
         return res.status(400).json({
           error: `Insufficient stock for ${
             product.name || name || productId
-          }. Available: ${product.stock ?? 0}`,
+          }. Available: ${availableStock}`,
         });
       }
 
@@ -833,6 +868,7 @@ router.post("/", authMiddleware, async (req, res) => {
         boxPrice: unitPrice,
         price: unitPrice,
         total: lineTotal,
+        previousStock: availableStock,
       });
     }
 
@@ -850,7 +886,7 @@ router.post("/", authMiddleware, async (req, res) => {
 
     // Create/update customer only when phone is provided
     const customerId = customer?.phone
-      ? await updateCustomerData(customer, total)
+      ? await updateCustomerData(customer, total, req.branchId)
       : null;
 
     // Build credit details if this is a credit sale
@@ -883,7 +919,7 @@ router.post("/", authMiddleware, async (req, res) => {
                   amount: initialPaid,
                   date: new Date(),
                   method: normalizedPM,
-                  recordedBy: salesPerson || "Admin",
+                  recordedBy: req.user.username || req.user.name || "Unknown",
                   notes: "Versement initial",
                   status: "pending",
                 },
@@ -894,6 +930,7 @@ router.post("/", authMiddleware, async (req, res) => {
 
     // UPDATED: Include type and reservation fields WITH CORRECT STATUS
     const saleData = {
+      branchId: req.branchId,
       saleId,
       saleNumber,
       customer: {
@@ -909,7 +946,7 @@ router.post("/", authMiddleware, async (req, res) => {
       paymentType: isCreditSale ? "credit" : "cash",
       ...(creditDetailsData && { creditDetails: creditDetailsData }),
       status: type === "reservation" ? "pending" : "completed",
-      salesPerson: salesPerson || "Admin",
+      salesPerson: req.user.username || req.user.name || "Unknown",
       type: type || "sale",
       reservationDate: reservationDate || null,
       reservationTime: reservationTime || null,
@@ -918,21 +955,59 @@ router.post("/", authMiddleware, async (req, res) => {
       ...(customCreatedAt && { createdAt: customCreatedAt }),
     };
 
-    for (const it of enrichedItems) {
-      const updated = await Product.findOneAndUpdate(
-        { _id: it.productId, stock: { $gte: it.quantity } },
-        { $inc: { stock: -it.quantity } },
-        { new: true }
-      );
-      if (!updated) {
-        return res.status(409).json({
-          error: "Stock changed for an item. Please refresh and try again.",
-        });
-      }
-    }
+    const session = await mongoose.startSession();
+    let savedSale;
+    try {
+      session.startTransaction();
 
-    const sale = new Sale(saleData);
-    const savedSale = await sale.save();
+      for (const it of enrichedItems) {
+        const updated = await adjustBranchStock({
+          productId: it.productId,
+          branchId: req.branchId,
+          delta: -it.quantity,
+          requireAvailable: true,
+          session,
+        });
+        if (!updated) {
+          await session.abortTransaction();
+          await session.endSession();
+          return res.status(409).json({
+            error: "Stock changed for an item. Please refresh and try again.",
+          });
+        }
+      }
+
+      const sale = new Sale(saleData);
+      savedSale = await sale.save({ session });
+
+      if (enrichedItems.length > 0) {
+        await StockMovement.create(
+          enrichedItems.map((it) => ({
+            productId: it.productId,
+            productName: it.name,
+            type: "sale",
+            quantity: it.quantity,
+            piecesPerCarton: it.piecesPerCarton,
+            reference: savedSale.saleId,
+            notes: customer?.name ? `Vente à ${customer.name}` : "Vente",
+            recordedBy: req.user.name || req.user.username || "Unknown",
+            recordedByUserId: req.user.userId,
+            recordedByRole: req.user.role,
+            branchId: req.branchId,
+            previousStock: it.previousStock,
+            newStock: it.previousStock - it.quantity,
+          })),
+          { session }
+        );
+      }
+
+      await session.commitTransaction();
+    } catch (txError) {
+      await session.abortTransaction();
+      throw txError;
+    } finally {
+      await session.endSession();
+    }
 
     return res.status(201).json(savedSale);
   } catch (error) {
@@ -974,7 +1049,7 @@ router.get("/expenses/all", authMiddleware, async (req, res) => {
       filter.status = status;
     }
 
-    const expenses = await Sale.find(filter)
+    const expenses = await Sale.find(scopedFilter(filter, req.branchId))
       .select('-__v -items') // Expenses don't have items
       .sort({ createdAt: -1 })
       .lean();
@@ -1024,7 +1099,7 @@ router.get("/reservations/all", authMiddleware, async (req, res) => {
       filter.status = status;
     }
 
-    const reservations = await Sale.find(filter)
+    const reservations = await Sale.find(scopedFilter(filter, req.branchId))
       .select('-__v') // Exclude version key
       .sort({ createdAt: -1 })
       .lean();
@@ -1056,7 +1131,7 @@ router.get("/:id", authMiddleware, async (req, res) => {
   try {
     const saleId = req.params.id;
     
-    const sale = await Sale.findById(saleId)
+    const sale = await Sale.findOne(scopedFilter({ _id: saleId }, req.branchId))
       .select('-__v') // Exclude version key
       .lean();
     
@@ -1069,10 +1144,10 @@ router.get("/:id", authMiddleware, async (req, res) => {
     let duplicateCount = 0;
     
     if (sale.saleId) {
-      potentialDuplicates = await Sale.find({
+      potentialDuplicates = await Sale.find(scopedFilter({
         saleId: sale.saleId,
         _id: { $ne: saleId }
-      })
+      }, req.branchId))
       .select('_id saleId createdAt status')
       .lean();
       
@@ -1120,7 +1195,7 @@ router.put("/:id", authMiddleware, async (req, res) => {
     } = req.body;
 
     // Find the original sale
-    const originalSale = await Sale.findById(id).lean();
+    const originalSale = await Sale.findOne(scopedFilter({ _id: id }, req.branchId)).lean();
     if (!originalSale) {
       return res.status(404).json({ error: "Sale not found" });
     }
@@ -1130,15 +1205,15 @@ router.put("/:id", authMiddleware, async (req, res) => {
       const userRole = req.user.role;
       
       // If reservation is completed, only admin can edit
-      if (originalSale.status === "completed" && userRole !== "admin") {
+      if (originalSale.status === "completed" && !req.user.isSuperAdmin) {
         return res.status(403).json({ 
           error: "Only admin can edit completed reservations" 
         });
       }
       
       // If reservation is pending, only admin and manager can edit
-      if (originalSale.status === "pending" && 
-          userRole !== "admin" && userRole !== "manager") {
+      if (originalSale.status === "pending" &&
+          !req.user.isSuperAdmin && userRole !== "manager") {
         return res.status(403).json({ 
           error: "Only admin and manager can edit pending reservations" 
         });
@@ -1185,8 +1260,8 @@ router.put("/:id", authMiddleware, async (req, res) => {
         changes.set('total', { from: originalSale.total, to: expenseAmount });
       }
 
-      const updatedExpense = await Sale.findByIdAndUpdate(
-        id,
+      const updatedExpense = await Sale.findOneAndUpdate(
+        scopedFilter({ _id: id }, req.branchId),
         {
           reason,
           recipientName,
@@ -1343,21 +1418,44 @@ router.put("/:id", authMiddleware, async (req, res) => {
     try {
       session.startTransaction();
 
+      const adjustmentMovements = [];
       for (const adjustment of stockAdjustments) {
-        const updatedProduct = await Product.findOneAndUpdate(
-          { _id: adjustment.productId, stock: { $gte: Math.max(0, -adjustment.adjustment) } },
-          { $inc: { stock: adjustment.adjustment } },
-          { new: true, session }
-        );
+        const productBefore = await Product.findById(adjustment.productId).session(session).lean();
+        const previousStock = getBranchStock(productBefore, req.branchId);
+        const updatedProduct = await adjustBranchStock({
+          productId: adjustment.productId,
+          branchId: req.branchId,
+          delta: adjustment.adjustment,
+          requireAvailable: adjustment.adjustment < 0,
+          session,
+        });
         if (!updatedProduct) {
           await session.abortTransaction();
           await session.endSession();
           return res.status(400).json({ error: "Insufficient stock for product update" });
         }
+        adjustmentMovements.push({
+          productId: updatedProduct._id,
+          productName: updatedProduct.name,
+          type: adjustment.adjustment > 0 ? "adjustment_in" : "adjustment_out",
+          quantity: Math.abs(adjustment.adjustment),
+          piecesPerCarton: updatedProduct.piecesPerCarton || 1,
+          reference: originalSale.saleId,
+          notes: reason || "Correction de vente",
+          recordedBy: req.user.name || req.user.username || "Unknown",
+          recordedByUserId: req.user.userId,
+          recordedByRole: req.user.role,
+          branchId: req.branchId,
+          previousStock,
+          newStock: previousStock + adjustment.adjustment,
+        });
+      }
+      if (adjustmentMovements.length > 0) {
+        await StockMovement.create(adjustmentMovements, { session });
       }
 
-      updatedSale = await Sale.findByIdAndUpdate(
-        id,
+      updatedSale = await Sale.findOneAndUpdate(
+        scopedFilter({ _id: id }, req.branchId),
         {
           customer,
           items: enrichedItems,
@@ -1391,7 +1489,7 @@ router.put("/:id", authMiddleware, async (req, res) => {
     }
 
     if (changes.has('customer') || changes.has('total')) {
-      await recalculateCustomerStats(originalSale.customerId);
+      await recalculateCustomerStats(originalSale.customerId, req.branchId);
     }
 
     res.json(updatedSale);
@@ -1408,9 +1506,8 @@ router.put("/:id", authMiddleware, async (req, res) => {
 router.patch("/:id/complete", authMiddleware, async (req, res) => {
   try {
     const { id } = req.params;
-    const { completedBy } = req.body;
 
-    const sale = await Sale.findById(id).lean();
+    const sale = await Sale.findOne(scopedFilter({ _id: id }, req.branchId)).lean();
     if (!sale) {
       return res.status(404).json({ error: "Réservation non trouvée" });
     }
@@ -1425,12 +1522,12 @@ router.patch("/:id/complete", authMiddleware, async (req, res) => {
       return res.status(400).json({ error: "Reservation already completed" });
     }
 
-    const updatedSale = await Sale.findByIdAndUpdate(
-      id,
+    const updatedSale = await Sale.findOneAndUpdate(
+      scopedFilter({ _id: id }, req.branchId),
       {
         status: "completed",
         completedAt: new Date(),
-        completedBy: completedBy || req.user.userId,
+        completedBy: req.user.username || req.user.userId,
       },
       { new: true }
     );
@@ -1447,13 +1544,13 @@ router.patch("/:id/pending", authMiddleware, async (req, res) => {
   try {
     const { id } = req.params;
 
-    const sale = await Sale.findById(id).lean();
+    const sale = await Sale.findOne(scopedFilter({ _id: id }, req.branchId)).lean();
     if (!sale) {
       return res.status(404).json({ error: "Réservation non trouvée" });
     }
 
     // 🔹 NEW: RESTRICTION - Only admin can return completed reservations to pending
-    if (sale.status === "completed" && req.user.role !== "admin") {
+    if (sale.status === "completed" && !req.user.isSuperAdmin) {
       return res.status(403).json({ 
         error: "Only admin can return completed reservations to pending" 
       });
@@ -1464,8 +1561,8 @@ router.patch("/:id/pending", authMiddleware, async (req, res) => {
       return res.status(400).json({ error: "This is not a reservation" });
     }
 
-    const updatedSale = await Sale.findByIdAndUpdate(
-      id,
+    const updatedSale = await Sale.findOneAndUpdate(
+      scopedFilter({ _id: id }, req.branchId),
       {
         status: "pending",
         completedAt: null,
@@ -1505,7 +1602,7 @@ router.patch("/:id/credit-payment", authMiddleware, async (req, res) => {
     const normalizedMethod = normalizePaymentMethod(method || "cash");
     const updatedSale = await Sale.findOneAndUpdate(
       {
-        _id: id,
+        ...scopedFilter({ _id: id }, req.branchId),
         paymentType: "credit",
         status: VALID_REVENUE_STATUS_FILTER,
         "creditDetails.payments.paymentId": { $ne: paymentId },
@@ -1539,7 +1636,7 @@ router.patch("/:id/credit-payment", authMiddleware, async (req, res) => {
     );
 
     if (!updatedSale) {
-      const sale = await Sale.findById(id).lean();
+      const sale = await Sale.findOne(scopedFilter({ _id: id }, req.branchId)).lean();
       if (!sale) return res.status(404).json({ error: "Vente non trouvée" });
       if (sale.paymentType !== "credit") {
         return res.status(400).json({ error: "Cette vente n'est pas à crédit" });
@@ -1602,7 +1699,7 @@ router.patch(
   async (req, res) => {
     try {
       const { id, paymentId } = req.params;
-      const sale = await Sale.findById(id).lean();
+      const sale = await Sale.findOne(scopedFilter({ _id: id }, req.branchId)).lean();
       if (!sale) return res.status(404).json({ error: "Vente non trouvée" });
       if (sale.paymentType !== "credit") {
         return res.status(400).json({ error: "Cette vente n'est pas à crédit" });
@@ -1627,7 +1724,7 @@ router.patch(
       const confirmedBy = req.user.username || req.user.userId;
       const updatedSale = await Sale.findOneAndUpdate(
         {
-          _id: id,
+          ...scopedFilter({ _id: id }, req.branchId),
           paymentType: "credit",
           status: VALID_REVENUE_STATUS_FILTER,
           "creditDetails.amountDue": { $gte: paymentAmount },
@@ -1695,7 +1792,7 @@ router.patch(
       );
 
       if (!updatedSale) {
-        const currentSale = await Sale.findById(id).lean();
+        const currentSale = await Sale.findOne(scopedFilter({ _id: id }, req.branchId)).lean();
         const currentPayment = currentSale?.creditDetails?.payments?.find(
           (candidate) => candidate.paymentId === paymentId
         );
@@ -1734,14 +1831,14 @@ router.patch(
 /** ---------- VOID/REFUND SALE ---------- **/
 router.patch("/:id/void", authMiddleware, async (req, res) => {
   try {
-    if (req.user.role !== "admin") {
+    if (!req.user.isSuperAdmin) {
       return res.status(403).json({ error: "Only admins can void sales" });
     }
 
     const { id } = req.params;
     const { reason } = req.body;
 
-    const sale = await Sale.findById(id).lean();
+    const sale = await Sale.findOne(scopedFilter({ _id: id }, req.branchId)).lean();
     if (!sale) {
       return res.status(404).json({ error: "Sale not found" });
     }
@@ -1757,17 +1854,41 @@ router.patch("/:id/void", authMiddleware, async (req, res) => {
       session.startTransaction();
 
       if ((sale.type === "sale" || sale.type === "reservation") && sale.items && sale.items.length > 0) {
+        const reversalMovements = [];
         for (const item of sale.items) {
-          await Product.findByIdAndUpdate(
-            item.productId,
-            { $inc: { stock: item.quantity } },
-            { session }
-          );
+          const productBefore = await Product.findById(item.productId).session(session).lean();
+          const previousStock = getBranchStock(productBefore, req.branchId);
+          const updatedProduct = await adjustBranchStock({
+            productId: item.productId,
+            branchId: req.branchId,
+            delta: item.quantity,
+            session,
+          });
+          if (updatedProduct) {
+            reversalMovements.push({
+              productId: item.productId,
+              productName: updatedProduct.name,
+              type: "adjustment_in",
+              quantity: item.quantity,
+              piecesPerCarton: updatedProduct.piecesPerCarton || 1,
+              reference: sale.saleId,
+              notes: reason || "Vente annulée",
+              recordedBy: req.user.name || req.user.username || "Unknown",
+              recordedByUserId: req.user.userId,
+              recordedByRole: req.user.role,
+              branchId: req.branchId,
+              previousStock,
+              newStock: previousStock + item.quantity,
+            });
+          }
+        }
+        if (reversalMovements.length > 0) {
+          await StockMovement.create(reversalMovements, { session });
         }
       }
 
-      voidedSale = await Sale.findByIdAndUpdate(
-        id,
+      voidedSale = await Sale.findOneAndUpdate(
+        scopedFilter({ _id: id }, req.branchId),
         {
           status: "voided",
           voidedBy: req.user.userId,
@@ -1793,7 +1914,7 @@ router.patch("/:id/void", authMiddleware, async (req, res) => {
     }
 
     if (sale.customerId && (sale.type === "sale" || sale.type === "reservation")) {
-      await recalculateCustomerStats(sale.customerId);
+      await recalculateCustomerStats(sale.customerId, req.branchId);
     }
 
     res.json(voidedSale);
@@ -1806,14 +1927,14 @@ router.patch("/:id/void", authMiddleware, async (req, res) => {
 /** ---------- DELETE SALE ---------- **/
 router.delete("/:id", authMiddleware, async (req, res) => {
   try {
-    const sale = await Sale.findById(req.params.id).lean();
+    const sale = await Sale.findOne(scopedFilter({ _id: req.params.id }, req.branchId)).lean();
     
     if (!sale) {
       return res.status(404).json({ error: "Sale not found" });
     }
 
     // 🔹 NEW: RESTRICTION - Only admin can delete reservations
-    if (sale.type === "reservation" && req.user.role !== "admin") {
+    if (sale.type === "reservation" && !req.user.isSuperAdmin) {
       return res.status(403).json({ 
         error: "Only admin can delete reservations" 
       });
@@ -1829,16 +1950,40 @@ router.delete("/:id", authMiddleware, async (req, res) => {
       if ((sale.type === "reservation" || sale.type === "sale") &&
           sale.items && sale.items.length > 0 &&
           sale.status !== "voided") {
+        const reversalMovements = [];
         for (const item of sale.items) {
-          await Product.findByIdAndUpdate(
-            item.productId,
-            { $inc: { stock: item.quantity } },
-            { session }
-          );
+          const productBefore = await Product.findById(item.productId).session(session).lean();
+          const previousStock = getBranchStock(productBefore, req.branchId);
+          const updatedProduct = await adjustBranchStock({
+            productId: item.productId,
+            branchId: req.branchId,
+            delta: item.quantity,
+            session,
+          });
+          if (updatedProduct) {
+            reversalMovements.push({
+              productId: item.productId,
+              productName: updatedProduct.name,
+              type: "adjustment_in",
+              quantity: item.quantity,
+              piecesPerCarton: updatedProduct.piecesPerCarton || 1,
+              reference: sale.saleId,
+              notes: "Vente supprimée",
+              recordedBy: req.user.name || req.user.username || "Unknown",
+              recordedByUserId: req.user.userId,
+              recordedByRole: req.user.role,
+              branchId: req.branchId,
+              previousStock,
+              newStock: previousStock + item.quantity,
+            });
+          }
+        }
+        if (reversalMovements.length > 0) {
+          await StockMovement.create(reversalMovements, { session });
         }
       }
 
-      await Sale.findByIdAndDelete(req.params.id).session(session);
+      await Sale.deleteOne(scopedFilter({ _id: req.params.id }, req.branchId)).session(session);
 
       await session.commitTransaction();
     } catch (txError) {
@@ -1849,7 +1994,7 @@ router.delete("/:id", authMiddleware, async (req, res) => {
     }
 
     if (customerId && (sale.type === "sale" || sale.type === "reservation")) {
-      await recalculateCustomerStats(customerId);
+      await recalculateCustomerStats(customerId, req.branchId);
     }
 
     res.json({

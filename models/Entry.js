@@ -1,6 +1,12 @@
 const mongoose = require("mongoose");
 
 const entrySchema = new mongoose.Schema({
+  branchId: {
+    type: String,
+    enum: ["butembo", "beni"],
+    default: "butembo",
+    index: true,
+  },
   entryId: {
     type: String,
     required: true,

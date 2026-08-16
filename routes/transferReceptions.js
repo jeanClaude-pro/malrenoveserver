@@ -5,7 +5,9 @@ const mongoose = require("mongoose");
 const TransferReception = require("../models/TransferReception");
 const Transfer = require("../models/Transfer");
 const Product = require("../models/Product");
+const StockMovement = require("../models/StockMovement");
 const authMiddleware = require("../middleware/auth");
+const { scopedFilter, getBranchStock, adjustBranchStock } = require("../utils/branchContext");
 
 function buildTimeframeFilter(query) {
   const { from, to, date, year, month } = query;
@@ -76,7 +78,7 @@ router.get("/", authMiddleware, async (req, res) => {
       ];
     }
 
-    const receptions = await TransferReception.find(filter).sort({ createdAt: -1 }).lean();
+    const receptions = await TransferReception.find(scopedFilter(filter, req.branchId)).sort({ createdAt: -1 }).lean();
 
     const activeReceptions = receptions.filter((r) => r.status === "active");
     const summary = {
@@ -96,7 +98,7 @@ router.get("/", authMiddleware, async (req, res) => {
 // ==================== GET ONE ====================
 router.get("/:id", authMiddleware, async (req, res) => {
   try {
-    const reception = await TransferReception.findById(req.params.id).lean();
+    const reception = await TransferReception.findOne(scopedFilter({ _id: req.params.id }, req.branchId)).lean();
     if (!reception) return res.status(404).json({ error: "Reception not found" });
     res.json({ success: true, data: reception });
   } catch (error) {
@@ -139,7 +141,7 @@ router.post("/", authMiddleware, async (req, res) => {
     let effectiveDeliveredBy;
 
     if (transferId) {
-      transfer = await Transfer.findById(transferId);
+      transfer = await Transfer.findOne(scopedFilter({ _id: transferId }, req.branchId));
       if (!transfer) return res.status(404).json({ error: "Transfer not found" });
 
       if (transfer.status === "cancelled") {
@@ -201,7 +203,7 @@ router.post("/", authMiddleware, async (req, res) => {
     const product = await Product.findById(effectiveProductId).lean();
     if (!product) return res.status(404).json({ error: "Product not found" });
 
-    const previousStock = Number(product.stock || 0);
+    const previousStock = getBranchStock(product, req.branchId);
     const newStock = previousStock + totalPieces;
     const receivedByName = receivedBy.trim();
 
@@ -210,13 +212,10 @@ router.post("/", authMiddleware, async (req, res) => {
     try {
       session.startTransaction();
 
-      await Product.findByIdAndUpdate(
-        effectiveProductId,
-        { $inc: { stock: totalPieces } },
-        { session }
-      );
+      await adjustBranchStock({ productId: effectiveProductId, branchId: req.branchId, delta: totalPieces, session });
 
       reception = new TransferReception({
+        branchId: req.branchId,
         transferId: transfer ? transfer._id : undefined,
         product: {
           productId: effectiveProductId,
@@ -242,6 +241,27 @@ router.post("/", authMiddleware, async (req, res) => {
         if (!isNaN(opDate.getTime()) && opDate <= new Date()) reception.createdAt = opDate;
       }
       await reception.save({ session });
+
+      await StockMovement.create(
+        [
+          {
+            productId: effectiveProductId,
+            productName,
+            type: "reception",
+            quantity: totalPieces,
+            piecesPerCarton,
+            reference: reception.receptionId,
+            notes: effectiveSourceLocation,
+            recordedBy: req.user.name || req.user.username || "Unknown",
+            recordedByUserId: req.user.userId || req.user._id,
+            recordedByRole: req.user.role,
+            branchId: req.branchId,
+            previousStock,
+            newStock,
+          },
+        ],
+        { session }
+      );
 
       if (transfer) {
         const previousTransferStatus = transfer.status;
@@ -286,7 +306,7 @@ router.post("/", authMiddleware, async (req, res) => {
 // ==================== EDIT ====================
 router.put("/:id", authMiddleware, async (req, res) => {
   try {
-    const original = await TransferReception.findById(req.params.id).lean();
+    const original = await TransferReception.findOne(scopedFilter({ _id: req.params.id }, req.branchId)).lean();
     if (!original) return res.status(404).json({ error: "Reception not found" });
     if (original.status === "voided") {
       return res.status(400).json({ error: "Cannot edit a voided reception" });
@@ -336,7 +356,7 @@ router.put("/:id", authMiddleware, async (req, res) => {
 
     const originalPieces = original.product.totalPieces;
     const netAdjustment = newTotalPieces - originalPieces;
-    const currentStock = Number(product.stock || 0);
+    const currentStock = getBranchStock(product, req.branchId);
 
     // Ensure reversing original + applying new won't make stock negative
     if (currentStock - originalPieces + newTotalPieces < 0) {
@@ -375,11 +395,13 @@ router.put("/:id", authMiddleware, async (req, res) => {
 
       if (netAdjustment !== 0) {
         if (netAdjustment < 0) {
-          const updatedProduct = await Product.findOneAndUpdate(
-            { _id: original.product.productId, stock: { $gte: -netAdjustment } },
-            { $inc: { stock: netAdjustment } },
-            { new: true, session }
-          );
+          const updatedProduct = await adjustBranchStock({
+            productId: original.product.productId,
+            branchId: req.branchId,
+            delta: netAdjustment,
+            requireAvailable: true,
+            session,
+          });
           if (!updatedProduct) {
             await session.abortTransaction();
             await session.endSession();
@@ -388,16 +410,33 @@ router.put("/:id", authMiddleware, async (req, res) => {
             });
           }
         } else {
-          await Product.findByIdAndUpdate(
-            original.product.productId,
-            { $inc: { stock: netAdjustment } },
-            { session }
-          );
+          await adjustBranchStock({ productId: original.product.productId, branchId: req.branchId, delta: netAdjustment, session });
         }
+
+        await StockMovement.create(
+          [
+            {
+              productId: original.product.productId,
+              productName: product.name,
+              type: netAdjustment > 0 ? "adjustment_in" : "adjustment_out",
+              quantity: Math.abs(netAdjustment),
+              piecesPerCarton,
+              reference: original.receptionId,
+              notes: reason.trim() || "Correction de réception",
+              recordedBy: req.user.name || req.user.username,
+              recordedByUserId: req.user._id,
+              recordedByRole: req.user.role,
+              branchId: req.branchId,
+              previousStock: currentStock,
+              newStock: currentStock + netAdjustment,
+            },
+          ],
+          { session }
+        );
       }
 
-      updated = await TransferReception.findByIdAndUpdate(
-        req.params.id,
+      updated = await TransferReception.findOneAndUpdate(
+        scopedFilter({ _id: req.params.id }, req.branchId),
         {
           "product.cartonQuantity": newCartons,
           "product.looseQuantity": newLoose,
@@ -441,11 +480,11 @@ router.put("/:id", authMiddleware, async (req, res) => {
 // ==================== VOID ====================
 router.patch("/:id/void", authMiddleware, async (req, res) => {
   try {
-    if (req.user.role !== "admin" && req.user.role !== "manager") {
+    if (!req.user.isSuperAdmin && req.user.role !== "manager") {
       return res.status(403).json({ error: "Only admin or manager can void receptions" });
     }
 
-    const reception = await TransferReception.findById(req.params.id).lean();
+    const reception = await TransferReception.findOne(scopedFilter({ _id: req.params.id }, req.branchId)).lean();
     if (!reception) return res.status(404).json({ error: "Reception not found" });
     if (reception.status === "voided") {
       return res.status(400).json({ error: "Reception is already voided" });
@@ -454,9 +493,10 @@ router.patch("/:id/void", authMiddleware, async (req, res) => {
     const { reason } = req.body;
 
     const product = await Product.findById(reception.product.productId).lean();
-    if (product && Number(product.stock) < reception.product.totalPieces) {
+    const currentStock = getBranchStock(product, req.branchId);
+    if (product && currentStock < reception.product.totalPieces) {
       return res.status(400).json({
-        error: `Cannot void: current stock (${product.stock}) is less than received quantity (${reception.product.totalPieces}). Inventory would go negative.`,
+        error: `Cannot void: current stock (${currentStock}) is less than received quantity (${reception.product.totalPieces}). Inventory would go negative.`,
       });
     }
 
@@ -465,14 +505,31 @@ router.patch("/:id/void", authMiddleware, async (req, res) => {
     try {
       session.startTransaction();
 
-      await Product.findByIdAndUpdate(
-        reception.product.productId,
-        { $inc: { stock: -reception.product.totalPieces } },
+      await adjustBranchStock({ productId: reception.product.productId, branchId: req.branchId, delta: -reception.product.totalPieces, requireAvailable: true, session });
+
+      await StockMovement.create(
+        [
+          {
+            productId: reception.product.productId,
+            productName: reception.product.name,
+            type: "adjustment_out",
+            quantity: reception.product.totalPieces,
+            piecesPerCarton: reception.product.piecesPerCarton || 1,
+            reference: reception.receptionId,
+            notes: reason || "Réception annulée",
+            recordedBy: req.user.name || req.user.username,
+            recordedByUserId: req.user._id,
+            recordedByRole: req.user.role,
+            branchId: req.branchId,
+            previousStock: currentStock,
+            newStock: currentStock - reception.product.totalPieces,
+          },
+        ],
         { session }
       );
 
-      voided = await TransferReception.findByIdAndUpdate(
-        req.params.id,
+      voided = await TransferReception.findOneAndUpdate(
+        scopedFilter({ _id: req.params.id }, req.branchId),
         {
           status: "voided",
           voidedBy: req.user.name || req.user.username,
@@ -496,7 +553,7 @@ router.patch("/:id/void", authMiddleware, async (req, res) => {
       // put it back in transit so it reappears as pending reception.
       if (reception.transferId) {
         await Transfer.findOneAndUpdate(
-          { _id: reception.transferId, status: "delivered" },
+          scopedFilter({ _id: reception.transferId, status: "delivered" }, req.branchId),
           {
             status: "in_transit",
             deliveredAt: null,
@@ -533,11 +590,11 @@ router.patch("/:id/void", authMiddleware, async (req, res) => {
 // ==================== DELETE ====================
 router.delete("/:id", authMiddleware, async (req, res) => {
   try {
-    if (req.user.role !== "admin") {
+    if (!req.user.isSuperAdmin) {
       return res.status(403).json({ error: "Only admin can delete receptions" });
     }
 
-    const reception = await TransferReception.findById(req.params.id).lean();
+    const reception = await TransferReception.findOne(scopedFilter({ _id: req.params.id }, req.branchId)).lean();
     if (!reception) return res.status(404).json({ error: "Reception not found" });
 
     const session = await mongoose.startSession();
@@ -546,23 +603,41 @@ router.delete("/:id", authMiddleware, async (req, res) => {
 
       if (reception.status === "active") {
         const product = await Product.findById(reception.product.productId).lean();
-        if (product && Number(product.stock) < reception.product.totalPieces) {
+        const currentStock = getBranchStock(product, req.branchId);
+        if (product && currentStock < reception.product.totalPieces) {
           await session.abortTransaction();
           await session.endSession();
           return res.status(400).json({
-            error: `Cannot delete: current stock (${product.stock}) is less than received quantity (${reception.product.totalPieces}). Inventory would go negative.`,
+            error: `Cannot delete: current stock (${currentStock}) is less than received quantity (${reception.product.totalPieces}). Inventory would go negative.`,
           });
         }
 
-        await Product.findByIdAndUpdate(
-          reception.product.productId,
-          { $inc: { stock: -reception.product.totalPieces } },
+        await adjustBranchStock({ productId: reception.product.productId, branchId: req.branchId, delta: -reception.product.totalPieces, requireAvailable: true, session });
+
+        await StockMovement.create(
+          [
+            {
+              productId: reception.product.productId,
+              productName: reception.product.name,
+              type: "adjustment_out",
+              quantity: reception.product.totalPieces,
+              piecesPerCarton: reception.product.piecesPerCarton || 1,
+              reference: reception.receptionId,
+              notes: "Réception supprimée",
+              recordedBy: req.user.name || req.user.username || "Unknown",
+              recordedByUserId: req.user._id,
+              recordedByRole: req.user.role,
+              branchId: req.branchId,
+              previousStock: currentStock,
+              newStock: currentStock - reception.product.totalPieces,
+            },
+          ],
           { session }
         );
 
         if (reception.transferId) {
           await Transfer.findOneAndUpdate(
-            { _id: reception.transferId, status: "delivered" },
+            scopedFilter({ _id: reception.transferId, status: "delivered" }, req.branchId),
             {
               status: "in_transit",
               deliveredAt: null,
@@ -582,7 +657,7 @@ router.delete("/:id", authMiddleware, async (req, res) => {
         }
       }
 
-      await TransferReception.findByIdAndDelete(req.params.id).session(session);
+      await TransferReception.deleteOne(scopedFilter({ _id: req.params.id }, req.branchId)).session(session);
 
       await session.commitTransaction();
     } catch (txError) {

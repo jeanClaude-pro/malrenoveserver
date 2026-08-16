@@ -17,6 +17,21 @@ const customerSchema = new mongoose.Schema({
     trim: true,
     default: ""
   },
+  branches: {
+    type: [String],
+    enum: ["butembo", "beni"],
+    default: undefined,
+  },
+  branchStats: {
+    type: Map,
+    of: new mongoose.Schema({
+      totalPurchases: { type: Number, default: 0 },
+      totalSpent: { type: Number, default: 0 },
+      firstPurchaseDate: Date,
+      lastPurchaseDate: Date,
+    }, { _id: false }),
+    default: undefined,
+  },
   totalPurchases: {
     type: Number,
     default: 0

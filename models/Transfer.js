@@ -3,6 +3,12 @@ const mongoose = require("mongoose");
 
 const transferSchema = new mongoose.Schema(
   {
+    branchId: {
+      type: String,
+      enum: ["butembo", "beni"],
+      default: "butembo",
+      index: true,
+    },
     transferId: {
       type: String,
       required: true,

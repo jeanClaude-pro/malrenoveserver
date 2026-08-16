@@ -1,4 +1,5 @@
 const User = require("../models/User");
+const { isSuperAdmin } = require("../utils/branchContext");
 
 async function isAdmin(req, res, next) {
   try {
@@ -8,7 +9,7 @@ async function isAdmin(req, res, next) {
       return res.status(404).json({ message: "User not found" });
     }
 
-    if (user.role !== "admin") {
+    if (!isSuperAdmin(user)) {
       return res.status(403).json({ message: "Access denied: Admins only" });
     }
 

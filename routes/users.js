@@ -4,6 +4,7 @@ const router = express.Router();
 const User = require("../models/User");
 const authMiddleware = require("../middleware/auth");
 const bcrypt = require("bcryptjs");
+const { normalizeBranchId } = require("../utils/branchContext");
 
 // Apply auth middleware to all routes
 router.use(authMiddleware);
@@ -12,7 +13,7 @@ router.use(authMiddleware);
 router.get("/me", async (req, res) => {
   const userId = req.user._id;
   try {
-    const user = await User.findById(userId).select("_id username email role isActive");
+    const user = await User.findById(userId).select("_id username email role branchId isActive");
     if (!user) {
       return res.status(404).json({ message: "User not found" });
     }
@@ -27,11 +28,11 @@ router.get("/me", async (req, res) => {
 router.get("/", async (req, res) => {
   try {
     // Check if user has permission to manage users
-    if (req.user.role !== 'admin') {
+    if (!req.user.isSuperAdmin) {
       return res.status(403).json({ message: "Access denied. Admin role required." });
     }
 
-    const users = await User.find().select("_id username email role isActive createdAt");
+    const users = await User.find().select("_id username email role branchId isActive createdAt");
     res.json(users);
   } catch (error) {
     console.error(error);
@@ -42,11 +43,11 @@ router.get("/", async (req, res) => {
 // Create new user (Admin only)
 router.post("/", async (req, res) => {
   try {
-    if (req.user.role !== 'admin') {
+    if (!req.user.isSuperAdmin) {
       return res.status(403).json({ message: "Access denied. Admin role required." });
     }
 
-    let { username, email, password, role } = req.body;
+    let { username, email, password, role, branchId } = req.body;
     username = (username || "").trim();
     email = (email || "").trim().toLowerCase();
     password = String(password || "");
@@ -60,7 +61,7 @@ router.post("/", async (req, res) => {
     }
 
     // Validate role
-    const validRoles = ["admin", "manager", "inventory_manager", "cashier_supervisor", "staff"];
+    const validRoles = ["admin", "superadmin", "manager", "inventory_manager", "cashier_supervisor", "staff"];
     if (!validRoles.includes(role)) {
       return res.status(400).json({ message: "Invalid role" });
     }
@@ -69,13 +70,14 @@ router.post("/", async (req, res) => {
       username,
       email,
       password: await bcrypt.hash(password, 10),
-      role
+      role,
+      branchId: normalizeBranchId(branchId),
     });
 
     await newUser.save();
     
     // Return user without password
-    const userResponse = await User.findById(newUser._id).select("_id username email role isActive");
+    const userResponse = await User.findById(newUser._id).select("_id username email role branchId isActive");
     res.status(201).json(userResponse);
   } catch (error) {
     if (error.code === 11000) {
@@ -89,12 +91,12 @@ router.post("/", async (req, res) => {
 // Update user role (Admin only)
 router.put("/:userId/role", async (req, res) => {
   try {
-    if (req.user.role !== 'admin') {
+    if (!req.user.isSuperAdmin) {
       return res.status(403).json({ message: "Access denied. Admin role required." });
     }
 
     const { role } = req.body;
-    const validRoles = ["admin", "manager", "inventory_manager", "cashier_supervisor", "staff"];
+    const validRoles = ["admin", "superadmin", "manager", "inventory_manager", "cashier_supervisor", "staff"];
     
     if (!validRoles.includes(role)) {
       return res.status(400).json({ message: "Invalid role" });
@@ -104,7 +106,7 @@ router.put("/:userId/role", async (req, res) => {
       req.params.userId,
       { role },
       { new: true }
-    ).select("_id username email role isActive");
+    ).select("_id username email role branchId isActive");
 
     if (!user) {
       return res.status(404).json({ message: "User not found" });
@@ -120,7 +122,7 @@ router.put("/:userId/role", async (req, res) => {
 // Toggle user active status (Admin only)
 router.put("/:userId/status", async (req, res) => {
   try {
-    if (req.user.role !== 'admin') {
+    if (!req.user.isSuperAdmin) {
       return res.status(403).json({ message: "Access denied. Admin role required." });
     }
 
@@ -139,6 +141,7 @@ router.put("/:userId/status", async (req, res) => {
         username: user.username,
         email: user.email,
         role: user.role,
+        branchId: normalizeBranchId(user.branchId),
         isActive: user.isActive
       }
     });
@@ -148,10 +151,30 @@ router.put("/:userId/status", async (req, res) => {
   }
 });
 
+router.put("/:userId/branch", async (req, res) => {
+  try {
+    if (!req.user.isSuperAdmin) {
+      return res.status(403).json({ message: "Access denied. Admin role required." });
+    }
+    const branchId = normalizeBranchId(req.body?.branchId, null);
+    if (!branchId) return res.status(400).json({ message: "Invalid branch" });
+    const user = await User.findByIdAndUpdate(
+      req.params.userId,
+      { branchId },
+      { new: true, runValidators: true }
+    ).select("_id username email role branchId isActive");
+    if (!user) return res.status(404).json({ message: "User not found" });
+    res.json(user);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: "Internal server error" });
+  }
+});
+
 // Delete user (Admin only)
 router.delete("/:userId", async (req, res) => {
   try {
-    if (req.user.role !== 'admin') {
+    if (!req.user.isSuperAdmin) {
       return res.status(403).json({ message: "Access denied. Admin role required." });
     }
 
@@ -179,7 +202,7 @@ router.put("/:userId/profile", async (req, res) => {
     const userId = req.params.userId;
 
     // Users can only update their own profile unless they're admin
-    if (req.user.role !== 'admin' && userId !== req.user._id.toString()) {
+    if (!req.user.isSuperAdmin && userId !== req.user._id.toString()) {
       return res.status(403).json({ message: "Access denied" });
     }
 
@@ -191,7 +214,7 @@ router.put("/:userId/profile", async (req, res) => {
       userId,
       updateData,
       { new: true }
-    ).select("_id username email role isActive");
+    ).select("_id username email role branchId isActive");
 
     if (!user) {
       return res.status(404).json({ message: "User not found" });

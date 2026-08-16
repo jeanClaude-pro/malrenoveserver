@@ -78,6 +78,12 @@ const saleItemSchema = new mongoose.Schema({
 
 const saleSchema = new mongoose.Schema(
   {
+    branchId: {
+      type: String,
+      enum: ["butembo", "beni"],
+      default: "butembo",
+      index: true,
+    },
     saleId: {
       type: String,
       required: true,

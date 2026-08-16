@@ -3,6 +3,39 @@ const router = express.Router();
 const Customer = require("../models/Customer");
 const Sale = require("../models/Sale");
 const authMiddleware = require("../middleware/auth");
+const { scopedFilter } = require("../utils/branchContext");
+
+function customerScope(branchId) {
+  return branchId === "butembo"
+    ? { $or: [{ branches: "butembo" }, { branches: { $exists: false } }, { branches: null }] }
+    : { branches: branchId };
+}
+
+function customerFilter(filter, branchId) {
+  return { $and: [filter || {}, customerScope(branchId)] };
+}
+
+function customerForBranch(customer, branchId) {
+  if (!customer) return customer;
+  const value = typeof customer.toObject === "function" ? customer.toObject() : { ...customer };
+  const stats = value.branchStats instanceof Map
+    ? value.branchStats.get(branchId)
+    : value.branchStats?.[branchId];
+  if (stats) {
+    value.totalPurchases = Number(stats.totalPurchases || 0);
+    value.totalSpent = Number(stats.totalSpent || 0);
+    value.firstPurchaseDate = stats.firstPurchaseDate || null;
+    value.lastPurchaseDate = stats.lastPurchaseDate || null;
+  } else if (branchId !== "butembo") {
+    value.totalPurchases = 0;
+    value.totalSpent = 0;
+    value.firstPurchaseDate = null;
+    value.lastPurchaseDate = null;
+  }
+  delete value.branchStats;
+  delete value.branches;
+  return value;
+}
 
 // All customer routes require authentication
 router.use(authMiddleware);
@@ -11,11 +44,8 @@ router.use(authMiddleware);
 router.get("/recent", async (req, res) => {
   try {
     const limit = Math.min(parseInt(req.query.limit) || 5, 20);
-    const customers = await Customer.find({ lastPurchaseDate: { $ne: null } })
-      .sort({ lastPurchaseDate: -1 })
-      .limit(limit)
-      .lean();
-    res.json(customers);
+    const customers = await Customer.find(customerFilter({}, req.branchId)).lean();
+    res.json(customers.map((customer) => customerForBranch(customer, req.branchId)).filter((customer) => customer.lastPurchaseDate).sort((a, b) => new Date(b.lastPurchaseDate) - new Date(a.lastPurchaseDate)).slice(0, limit));
   } catch (error) {
     console.error("Error fetching recent customers:", error);
     res.status(500).json({ error: "Failed to fetch recent customers" });
@@ -30,19 +60,19 @@ router.get("/fiche", async (req, res) => {
       return res.status(400).json({ error: "Phone number is required" });
     }
 
-    const customer = await Customer.findOne({ phone: phone.trim() }).lean();
+    const customer = await Customer.findOne(customerFilter({ phone: phone.trim() }, req.branchId)).lean();
     if (!customer) {
       return res.status(404).json({ error: "No customer found with that phone number" });
     }
 
     // Fetch all sales linked to this customer (by customerId or phone fallback)
-    const sales = await Sale.find({
+    const sales = await Sale.find(scopedFilter({
       $or: [
         { customerId: customer._id },
         { "customer.phone": phone.trim() },
       ],
       status: { $nin: ["voided", "corrected"] },
-    })
+    }, req.branchId))
       .sort({ createdAt: -1 })
       .lean();
 
@@ -60,7 +90,7 @@ router.get("/fiche", async (req, res) => {
     const unpaidCredits = creditSales.filter((s) => !s.creditDetails?.fullyPaid);
 
     res.json({
-      customer,
+      customer: customerForBranch(customer, req.branchId),
       sales,
       summary: {
         totalSales: sales.length,
@@ -84,10 +114,11 @@ router.get("/stats/top", async (req, res) => {
     const { limit = 10, timeFrame } = req.query;
 
     let filter = {};
+    let dateFilter = null;
 
     if (timeFrame && timeFrame !== "all") {
       const now = new Date();
-      let dateFilter = {};
+      dateFilter = {};
 
       switch (timeFrame) {
         case "today":
@@ -104,12 +135,19 @@ router.get("/stats/top", async (req, res) => {
           break;
       }
 
-      filter.lastPurchaseDate = dateFilter;
     }
 
-    const topCustomers = await Customer.find(filter)
-      .sort({ totalSpent: -1 })
-      .limit(parseInt(limit));
+    const topCustomers = (await Customer.find(customerFilter(filter, req.branchId)).lean())
+      .map((customer) => customerForBranch(customer, req.branchId))
+      .filter((customer) => {
+        if (!dateFilter) return true;
+        const purchaseDate = customer.lastPurchaseDate ? new Date(customer.lastPurchaseDate) : null;
+        if (!purchaseDate || Number.isNaN(purchaseDate.getTime())) return false;
+        return (!dateFilter.$gte || purchaseDate >= dateFilter.$gte) &&
+          (!dateFilter.$lte || purchaseDate <= dateFilter.$lte);
+      })
+      .sort((a, b) => b.totalSpent - a.totalSpent)
+      .slice(0, parseInt(limit));
 
     res.json(topCustomers);
   } catch (error) {
@@ -133,6 +171,7 @@ router.get("/", async (req, res) => {
     } = req.query;
 
     const filter = {};
+    let dateFilter = null;
 
     if (search) {
       filter.$or = [
@@ -144,7 +183,7 @@ router.get("/", async (req, res) => {
 
     if (timeFrame && timeFrame !== "all") {
       const now = new Date();
-      let dateFilter = {};
+      dateFilter = {};
 
       switch (timeFrame) {
         case "today":
@@ -172,41 +211,35 @@ router.get("/", async (req, res) => {
           break;
       }
 
-      filter.lastPurchaseDate = dateFilter;
     }
 
-    if (minSpent || maxSpent) {
-      filter.totalSpent = {};
-      if (minSpent) filter.totalSpent.$gte = parseFloat(minSpent);
-      if (maxSpent) filter.totalSpent.$lte = parseFloat(maxSpent);
-    }
+    const minimumSpent = minSpent !== undefined && minSpent !== "" ? Number(minSpent) : null;
+    const maximumSpent = maxSpent !== undefined && maxSpent !== "" ? Number(maxSpent) : null;
 
-    const [customers, total, stats] = await Promise.all([
-      Customer.find(filter)
-        .sort({ lastPurchaseDate: -1 })
-        .limit(limit * 1)
-        .skip((page - 1) * limit)
-        .lean(),
-      Customer.countDocuments(filter),
-      Customer.aggregate([
-        { $match: filter },
-        {
-          $group: {
-            _id: null,
-            totalCustomers: { $sum: 1 },
-            totalRevenue: { $sum: "$totalSpent" },
-            averageSpent: { $avg: "$totalSpent" },
-          },
-        },
-      ]),
-    ]);
+    const normalized = (await Customer.find(customerFilter(filter, req.branchId)).lean())
+      .map((customer) => customerForBranch(customer, req.branchId))
+      .filter((customer) => {
+        const totalSpent = Number(customer.totalSpent || 0);
+        if (minimumSpent !== null && Number.isFinite(minimumSpent) && totalSpent < minimumSpent) return false;
+        if (maximumSpent !== null && Number.isFinite(maximumSpent) && totalSpent > maximumSpent) return false;
+        if (!dateFilter) return true;
+        const purchaseDate = customer.lastPurchaseDate ? new Date(customer.lastPurchaseDate) : null;
+        if (!purchaseDate || Number.isNaN(purchaseDate.getTime())) return false;
+        return (!dateFilter.$gte || purchaseDate >= dateFilter.$gte) &&
+          (!dateFilter.$lte || purchaseDate <= dateFilter.$lte);
+      })
+      .sort((a, b) => new Date(b.lastPurchaseDate || 0) - new Date(a.lastPurchaseDate || 0));
+    const total = normalized.length;
+    const customers = normalized.slice((Number(page) - 1) * Number(limit), Number(page) * Number(limit));
+    const totalRevenue = normalized.reduce((sum, customer) => sum + Number(customer.totalSpent || 0), 0);
+    const stats = { totalCustomers: total, totalRevenue, averageSpent: total ? totalRevenue / total : 0 };
 
     res.json({
       customers,
       totalPages: Math.ceil(total / limit),
       currentPage: Number(page),
       total,
-      stats: stats[0] || { totalCustomers: 0, totalRevenue: 0, averageSpent: 0 },
+      stats,
     });
   } catch (error) {
     console.error("Error fetching customers:", error);
@@ -231,25 +264,20 @@ router.get("/all", async (req, res) => {
     const sort = {};
     sort[sortBy] = sortOrder === "desc" ? -1 : 1;
 
-    const [customers, stats] = await Promise.all([
-      Customer.find(filter).sort(sort).lean(),
-      Customer.aggregate([
-        {
-          $group: {
-            _id: null,
-            totalCustomers: { $sum: 1 },
-            totalRevenue: { $sum: "$totalSpent" },
-            averageSpent: { $avg: "$totalSpent" },
-            totalPurchases: { $sum: "$totalPurchases" },
-          },
-        },
-      ]),
-    ]);
+    const customers = (await Customer.find(customerFilter(filter, req.branchId)).lean())
+      .map((customer) => customerForBranch(customer, req.branchId))
+      .sort((a, b) => {
+        const direction = sortOrder === "desc" ? -1 : 1;
+        return (Number(a[sortBy] || 0) - Number(b[sortBy] || 0)) * direction;
+      });
+    const totalRevenue = customers.reduce((sum, customer) => sum + Number(customer.totalSpent || 0), 0);
+    const totalPurchases = customers.reduce((sum, customer) => sum + Number(customer.totalPurchases || 0), 0);
+    const stats = { totalCustomers: customers.length, totalRevenue, averageSpent: customers.length ? totalRevenue / customers.length : 0, totalPurchases };
 
     res.json({
       customers,
       total: customers.length,
-      stats: stats[0] || { totalCustomers: 0, totalRevenue: 0, averageSpent: 0, totalPurchases: 0 },
+      stats,
     });
   } catch (error) {
     console.error("Error fetching all customers:", error);
@@ -260,11 +288,11 @@ router.get("/all", async (req, res) => {
 // GET /api/customers/phone/:phone — lookup by phone (used in NewSale auto-fill)
 router.get("/phone/:phone", async (req, res) => {
   try {
-    const customer = await Customer.findOne({ phone: req.params.phone }).lean();
+    const customer = await Customer.findOne(customerFilter({ phone: req.params.phone }, req.branchId)).lean();
     if (!customer) {
       return res.status(404).json({ error: "Customer not found" });
     }
-    res.json(customer);
+    res.json(customerForBranch(customer, req.branchId));
   } catch (error) {
     console.error("Error fetching customer by phone:", error);
     res.status(500).json({ error: "Failed to fetch customer" });
@@ -275,11 +303,11 @@ router.get("/phone/:phone", async (req, res) => {
 router.get("/:id", async (req, res) => {
   try {
     const [customer, purchaseHistory] = await Promise.all([
-      Customer.findById(req.params.id).lean(),
-      Sale.find({
+      Customer.findOne(customerFilter({ _id: req.params.id }, req.branchId)).lean(),
+      Sale.find(scopedFilter({
         customerId: req.params.id,
         status: { $nin: ["voided", "corrected"] },
-      })
+      }, req.branchId))
         .sort({ createdAt: -1 })
         .lean(),
     ]);
@@ -288,7 +316,7 @@ router.get("/:id", async (req, res) => {
       return res.status(404).json({ error: "Customer not found" });
     }
 
-    res.json({ ...customer, purchaseHistory });
+    res.json({ ...customerForBranch(customer, req.branchId), purchaseHistory });
   } catch (error) {
     console.error("Error fetching customer:", error);
     if (error.name === "CastError") {
@@ -310,8 +338,8 @@ router.put("/:id", async (req, res) => {
     if (address !== undefined) updateData.address = address;
     if (notes !== undefined) updateData.notes = notes;
 
-    const customer = await Customer.findByIdAndUpdate(
-      req.params.id,
+    const customer = await Customer.findOneAndUpdate(
+      customerFilter({ _id: req.params.id }, req.branchId),
       updateData,
       { new: true, runValidators: true }
     );
@@ -320,7 +348,7 @@ router.put("/:id", async (req, res) => {
       return res.status(404).json({ error: "Customer not found" });
     }
 
-    res.json(customer);
+    res.json(customerForBranch(customer, req.branchId));
   } catch (error) {
     console.error("Error updating customer:", error);
     if (error.name === "CastError") {
@@ -344,7 +372,7 @@ router.delete("/:id", async (req, res) => {
       });
     }
 
-    const customer = await Customer.findByIdAndDelete(req.params.id);
+    const customer = await Customer.findOneAndDelete(customerFilter({ _id: req.params.id }, req.branchId));
     if (!customer) {
       return res.status(404).json({ error: "Customer not found" });
     }

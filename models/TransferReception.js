@@ -22,6 +22,12 @@ const editHistorySchema = new mongoose.Schema(
 
 const transferReceptionSchema = new mongoose.Schema(
   {
+    branchId: {
+      type: String,
+      enum: ["butembo", "beni"],
+      default: "butembo",
+      index: true,
+    },
     receptionId: { type: String, unique: true },
 
     // Links this reception back to the Transfer it fulfills. Unique+sparse so a

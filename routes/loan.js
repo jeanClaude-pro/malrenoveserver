@@ -2,6 +2,7 @@ const express = require("express");
 const router = express.Router();
 const Loan = require("../models/Loan");
 const authMiddleware = require("../middleware/auth");
+const { scopedFilter } = require("../utils/branchContext");
 
 function generateLoanId() {
   return `LOAN-${Date.now()}-${Math.random().toString(36).substr(2, 5).toUpperCase()}`;
@@ -16,7 +17,7 @@ router.get("/", authMiddleware, async (req, res) => {
       filter.status = status;
     }
 
-    const loans = await Loan.find(filter).sort({ createdAt: -1 }).lean();
+    const loans = await Loan.find(scopedFilter(filter, req.branchId)).sort({ createdAt: -1 }).lean();
     res.json(loans);
   } catch (error) {
     console.error("Error fetching loans:", error);
@@ -41,13 +42,14 @@ router.post("/", authMiddleware, async (req, res) => {
     }
 
     const loan = new Loan({
+      branchId: req.branchId,
       loanId: generateLoanId(),
       borrowerName: String(borrowerName).trim(),
       borrowerPhone: String(borrowerPhone).trim(),
       amount: loanAmount,
       dueDate: new Date(dueDate),
       notes: notes ? String(notes).trim() : "",
-      recordedBy: req.user?.id || "Unknown",
+      recordedBy: req.user?.username || req.user?.name || req.user?.id || "Unknown",
     });
 
     const savedLoan = await loan.save();
@@ -65,7 +67,7 @@ router.post("/", authMiddleware, async (req, res) => {
 /** ---------- GET LOAN BY ID ---------- **/
 router.get("/:id", authMiddleware, async (req, res) => {
   try {
-    const loan = await Loan.findById(req.params.id);
+    const loan = await Loan.findOne(scopedFilter({ _id: req.params.id }, req.branchId));
     if (!loan) {
       return res.status(404).json({ error: "Loan not found" });
     }
@@ -88,7 +90,7 @@ router.patch("/:id/pay", authMiddleware, async (req, res) => {
       return res.status(400).json({ error: "Payment amount must be a positive number" });
     }
 
-    const loan = await Loan.findById(req.params.id);
+    const loan = await Loan.findOne(scopedFilter({ _id: req.params.id }, req.branchId));
     if (!loan) {
       return res.status(404).json({ error: "Loan not found" });
     }
@@ -110,7 +112,7 @@ router.patch("/:id/pay", authMiddleware, async (req, res) => {
 /** ---------- DELETE LOAN ---------- **/
 router.delete("/:id", authMiddleware, async (req, res) => {
   try {
-    const loan = await Loan.findByIdAndDelete(req.params.id);
+    const loan = await Loan.findOneAndDelete(scopedFilter({ _id: req.params.id }, req.branchId));
     if (!loan) {
       return res.status(404).json({ error: "Loan not found" });
     }

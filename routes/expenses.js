@@ -2,6 +2,7 @@ const express = require("express");
 const router = express.Router();
 const Expense = require("../models/Expense");
 const authMiddleware = require("../middleware/auth");
+const { scopedFilter } = require("../utils/branchContext");
 const nodemailer = require("nodemailer");
 
 // ✅ CREATE EMAIL TRANSPORTER
@@ -453,7 +454,7 @@ router.get("/", authMiddleware, async (req, res) => {
     }
 
     // Execute query - get ALL records within timeframe (no skip/limit)
-    const expenses = await Expense.find(filter)
+    const expenses = await Expense.find(scopedFilter(filter, req.branchId))
       .select('-__v') // Exclude version key
       .sort({ createdAt: -1 }) // Newest first
       .lean();
@@ -588,7 +589,7 @@ router.post("/", authMiddleware, async (req, res) => {
     const sanitizedRecipientName = sanitizeInput(recipientName);
     const sanitizedRecipientPhone = sanitizeInput(recipientPhone).replace(/\s+/g, "");
     const sanitizedNotes = sanitizeInput(notes);
-    const sanitizedRecordedBy = sanitizeInput(recordedBy || req.user?.id || "Unknown");
+    const sanitizedRecordedBy = sanitizeInput(req.user?.username || req.user?.name || req.user?.id || "Unknown");
 
     const normalizedPM = normalizePaymentMethod(paymentMethod);
 
@@ -599,6 +600,7 @@ router.post("/", authMiddleware, async (req, res) => {
       .toUpperCase()}`;
 
     const expenseData = {
+      branchId: req.branchId,
       expenseId,
       reason: sanitizedReason,
       recipientName: sanitizedRecipientName,
@@ -639,7 +641,7 @@ router.post("/", authMiddleware, async (req, res) => {
 /** ---------- GET EXPENSE BY ID ---------- **/
 router.get("/:id", authMiddleware, async (req, res) => {
   try {
-    const expense = await Expense.findById(req.params.id);
+    const expense = await Expense.findOne(scopedFilter({ _id: req.params.id }, req.branchId));
     if (!expense) {
       return res.status(404).json({ error: "Expense not found" });
     }
@@ -656,14 +658,14 @@ router.get("/:id", authMiddleware, async (req, res) => {
 /** ---------- VALIDATE EXPENSE ---------- **/
 router.patch("/:id/validate", authMiddleware, async (req, res) => {
   try {
-    const { validatedBy, notes } = req.body;
+    const { notes } = req.body;
     
     // Check authorization
     if (req.user && !req.user.canValidate) {
       return res.status(403).json({ error: "Insufficient permissions to validate expenses" });
     }
 
-    const expense = await Expense.findById(req.params.id);
+    const expense = await Expense.findOne(scopedFilter({ _id: req.params.id }, req.branchId));
     if (!expense) {
       return res.status(404).json({ error: "Expense not found" });
     }
@@ -679,11 +681,11 @@ router.patch("/:id/validate", authMiddleware, async (req, res) => {
     const validationNotes = notes ? `Validated: ${notes}` : "Expense validated";
     const updatedNotes = expense.notes ? `${expense.notes}\n${validationNotes}` : validationNotes;
 
-    const updatedExpense = await Expense.findByIdAndUpdate(
-      req.params.id,
+    const updatedExpense = await Expense.findOneAndUpdate(
+      scopedFilter({ _id: req.params.id }, req.branchId),
       {
         status: "validated",
-        validatedBy: validatedBy || req.user?.id || "Admin",
+        validatedBy: req.user?.username || req.user?.name || req.user?.id || "Admin",
         validatedAt: new Date(),
         notes: updatedNotes
       },
@@ -710,7 +712,7 @@ router.patch("/:id/reject", authMiddleware, async (req, res) => {
       return res.status(403).json({ error: "Insufficient permissions to reject expenses" });
     }
 
-    const expense = await Expense.findById(req.params.id);
+    const expense = await Expense.findOne(scopedFilter({ _id: req.params.id }, req.branchId));
     if (!expense) {
       return res.status(404).json({ error: "Expense not found" });
     }
@@ -730,11 +732,11 @@ router.patch("/:id/reject", authMiddleware, async (req, res) => {
     const rejectionNotes = `Rejected: ${reason}${notes ? ` - ${notes}` : ''}`;
     const updatedNotes = expense.notes ? `${expense.notes}\n${rejectionNotes}` : rejectionNotes;
 
-    const updatedExpense = await Expense.findByIdAndUpdate(
-      req.params.id,
+    const updatedExpense = await Expense.findOneAndUpdate(
+      scopedFilter({ _id: req.params.id }, req.branchId),
       {
         status: "rejected",
-        validatedBy: req.user?.id || "Admin",
+        validatedBy: req.user?.username || req.user?.name || req.user?.id || "Admin",
         validatedAt: new Date(),
         notes: updatedNotes
       },
@@ -780,7 +782,7 @@ router.put("/:id", authMiddleware, async (req, res) => {
     const normalizedPM = normalizePaymentMethod(paymentMethod);
 
     // Check if expense exists
-    const existingExpense = await Expense.findById(req.params.id);
+    const existingExpense = await Expense.findOne(scopedFilter({ _id: req.params.id }, req.branchId));
     if (!existingExpense) {
       return res.status(404).json({ error: "Expense not found" });
     }
@@ -836,8 +838,8 @@ router.put("/:id", authMiddleware, async (req, res) => {
       updateData.validatedAt = new Date();
     }
 
-    const updatedExpense = await Expense.findByIdAndUpdate(
-      req.params.id,
+    const updatedExpense = await Expense.findOneAndUpdate(
+      scopedFilter({ _id: req.params.id }, req.branchId),
       updateData,
       { new: true, runValidators: true }
     );
@@ -872,7 +874,7 @@ router.delete("/:id/admin", authMiddleware, async (req, res) => {
       });
     }
 
-    const expense = await Expense.findById(req.params.id);
+    const expense = await Expense.findOne(scopedFilter({ _id: req.params.id }, req.branchId));
     if (!expense) {
       return res.status(404).json({ error: "Expense not found" });
     }
@@ -887,7 +889,7 @@ router.delete("/:id/admin", authMiddleware, async (req, res) => {
       recipientName: expense.recipientName
     };
 
-    await Expense.findByIdAndDelete(req.params.id);
+    await Expense.deleteOne(scopedFilter({ _id: req.params.id }, req.branchId));
 
     // Send deletion notification
     sendExpenseDeletionNotification(deletedExpenseInfo, req.user?.id || "Admin");
@@ -909,7 +911,7 @@ router.delete("/:id/admin", authMiddleware, async (req, res) => {
 /** ---------- REGULAR DELETE EXPENSE (FOR PENDING ONLY) ---------- **/
 router.delete("/:id", authMiddleware, async (req, res) => {
   try {
-    const expense = await Expense.findById(req.params.id);
+    const expense = await Expense.findOne(scopedFilter({ _id: req.params.id }, req.branchId));
     if (!expense) {
       return res.status(404).json({ error: "Expense not found" });
     }
@@ -928,7 +930,7 @@ router.delete("/:id", authMiddleware, async (req, res) => {
       });
     }
 
-    await Expense.findByIdAndDelete(req.params.id);
+    await Expense.deleteOne(scopedFilter({ _id: req.params.id }, req.branchId));
     res.json({ 
       message: "Expense deleted successfully",
       deletedExpense: {
@@ -961,7 +963,7 @@ router.get("/stats/summary", authMiddleware, async (req, res) => {
     }
 
     const stats = await Expense.aggregate([
-      { $match: timeframeFilter },
+      { $match: scopedFilter(timeframeFilter, req.branchId) },
       {
         $group: {
           _id: "$status",
@@ -972,7 +974,7 @@ router.get("/stats/summary", authMiddleware, async (req, res) => {
     ]);
 
     const totalStats = await Expense.aggregate([
-      { $match: timeframeFilter },
+      { $match: scopedFilter(timeframeFilter, req.branchId) },
       {
         $group: {
           _id: null,
@@ -986,7 +988,7 @@ router.get("/stats/summary", authMiddleware, async (req, res) => {
     ]);
 
     const paymentMethodStats = await Expense.aggregate([
-      { $match: timeframeFilter },
+      { $match: scopedFilter(timeframeFilter, req.branchId) },
       {
         $group: {
           _id: "$paymentMethod",
@@ -999,7 +1001,7 @@ router.get("/stats/summary", authMiddleware, async (req, res) => {
 
     // Get daily breakdown for the timeframe
     const dailyBreakdown = await Expense.aggregate([
-      { $match: timeframeFilter },
+      { $match: scopedFilter(timeframeFilter, req.branchId) },
       {
         $group: {
           _id: {
@@ -1017,7 +1019,7 @@ router.get("/stats/summary", authMiddleware, async (req, res) => {
     ]);
 
     // Get top expenses
-    const topExpenses = await Expense.find(timeframeFilter)
+    const topExpenses = await Expense.find(scopedFilter(timeframeFilter, req.branchId))
       .sort({ amount: -1 })
       .limit(10)
       .select('expenseId reason amount status recipientName createdAt')
@@ -1025,7 +1027,7 @@ router.get("/stats/summary", authMiddleware, async (req, res) => {
 
     // Get most frequent recipients
     const frequentRecipients = await Expense.aggregate([
-      { $match: timeframeFilter },
+      { $match: scopedFilter(timeframeFilter, req.branchId) },
       {
         $group: {
           _id: "$recipientName",
@@ -1073,7 +1075,7 @@ router.get("/stats/summary", authMiddleware, async (req, res) => {
 /** ---------- GET EXPENSE HISTORY/AUDIT LOG ---------- **/
 router.get("/:id/history", authMiddleware, async (req, res) => {
   try {
-    const expense = await Expense.findById(req.params.id);
+    const expense = await Expense.findOne(scopedFilter({ _id: req.params.id }, req.branchId));
     if (!expense) {
       return res.status(404).json({ error: "Expense not found" });
     }
@@ -1127,7 +1129,7 @@ router.get("/recipient/:phone", authMiddleware, async (req, res) => {
     // Add recipient filter
     timeframeFilter.recipientPhone = { $regex: phone, $options: "i" };
 
-    const expenses = await Expense.find(timeframeFilter)
+    const expenses = await Expense.find(scopedFilter(timeframeFilter, req.branchId))
       .sort({ createdAt: -1 })
       .lean();
 
@@ -1190,7 +1192,7 @@ router.get("/status/:status", authMiddleware, async (req, res) => {
     // Add status filter
     timeframeFilter.status = status;
 
-    const expenses = await Expense.find(timeframeFilter)
+    const expenses = await Expense.find(scopedFilter(timeframeFilter, req.branchId))
       .sort({ createdAt: -1 })
       .lean();
 

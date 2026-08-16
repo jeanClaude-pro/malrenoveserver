@@ -1,8 +1,45 @@
 // models/CarTrip.js
 const mongoose = require("mongoose");
 
+const cargoProductSchema = new mongoose.Schema(
+  {
+    productId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Product",
+      required: true,
+    },
+    productName: { type: String, required: true, trim: true },
+    boxesCount: { type: Number, required: true, min: 1 },
+    piecesPerBox: { type: Number, required: true, min: 1 },
+    totalPieces: { type: Number, required: true, min: 1 },
+    weight: { type: Number, min: 0, default: 0 },
+    value: { type: Number, min: 0, default: 0 },
+  },
+  { _id: false }
+);
+
+const inventoryItemSchema = new mongoose.Schema(
+  {
+    productId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Product",
+      required: true,
+    },
+    productName: { type: String, required: true, trim: true },
+    quantity: { type: Number, required: true, min: 1 },
+    piecesPerCarton: { type: Number, required: true, min: 1, default: 1 },
+  },
+  { _id: false }
+);
+
 const carTripSchema = new mongoose.Schema(
   {
+    branchId: {
+      type: String,
+      enum: ["butembo", "beni"],
+      default: "butembo",
+      index: true,
+    },
     tripId: {
       type: String,
       required: true,
@@ -87,6 +124,13 @@ const carTripSchema = new mongoose.Schema(
         min: 0,
       },
     },
+    // New trips keep every carried product here. `cargo` remains in place as a
+    // legacy single-product snapshot so existing records and older clients keep
+    // working.
+    products: {
+      type: [cargoProductSchema],
+      default: undefined,
+    },
     // Trip Details
     departureTime: {
       type: Date,
@@ -107,8 +151,14 @@ const carTripSchema = new mongoose.Schema(
       receivedBoxes: { type: Number, min: 0, default: 0 },
       receivedPieces: { type: Number, min: 0, default: 0 },
       totalReceivedPieces: { type: Number, min: 0, default: 0 },
+      products: { type: [inventoryItemSchema], default: undefined },
       notes: { type: String, trim: true, maxlength: 1000, default: "" },
     },
+    // Exact inventory snapshot credited by arrival confirmation. It is used to
+    // make confirmation idempotent and to safely reconcile edits/deletions.
+    inventoryProcessed: { type: Boolean, default: false },
+    inventoryProcessedAt: { type: Date, default: null },
+    inventoryItems: { type: [inventoryItemSchema], default: undefined },
     status: {
       type: String,
       enum: ["planned", "en_route", "delayed", "arrived", "cancelled", "completed"],
@@ -192,7 +242,21 @@ const carTripSchema = new mongoose.Schema(
 
 // Pre-save middleware to calculate total pieces and total cost
 carTripSchema.pre("save", async function () {
-  if (this.cargo.boxesCount && this.cargo.piecesPerBox) {
+  if (Array.isArray(this.products) && this.products.length > 0) {
+    for (const product of this.products) {
+      product.totalPieces = product.boxesCount * product.piecesPerBox;
+    }
+
+    // Keep the former single-cargo shape populated for backward compatibility.
+    const firstProduct = this.products[0];
+    this.cargo.productId = firstProduct.productId;
+    this.cargo.productName = firstProduct.productName;
+    this.cargo.boxesCount = firstProduct.boxesCount;
+    this.cargo.piecesPerBox = firstProduct.piecesPerBox;
+    this.cargo.totalPieces = firstProduct.totalPieces;
+    this.cargo.weight = firstProduct.weight || 0;
+    this.cargo.value = firstProduct.value || 0;
+  } else if (this.cargo.boxesCount && this.cargo.piecesPerBox) {
     this.cargo.totalPieces = this.cargo.boxesCount * this.cargo.piecesPerBox;
   }
   this.totalCost = (this.fuelCost || 0) + (this.tollCost || 0) + (this.otherCosts || 0);

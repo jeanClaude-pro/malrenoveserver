@@ -2,6 +2,12 @@ const mongoose = require("mongoose");
 
 const loanSchema = new mongoose.Schema(
   {
+    branchId: {
+      type: String,
+      enum: ["butembo", "beni"],
+      default: "butembo",
+      index: true,
+    },
     loanId: {
       type: String,
       required: true,

@@ -5,6 +5,7 @@ const Sale = require("../models/Sale");
 const Entry = require("../models/Entry");
 const Expense = require("../models/Expense");
 const authMiddleware = require("../middleware/auth");
+const { scopedFilter, BRANCHES } = require("../utils/branchContext");
 
 // GMT+2 timezone offset used across the POS
 const TZ = "+02:00";
@@ -12,16 +13,16 @@ const TZ = "+02:00";
 // Fetch and compute the full all-time daily rolling balance in one pass.
 // Returns every calendar day that has at least one transaction, in date order,
 // with openingBalance and closingBalance correctly chained.
-async function computeAllDailyBalances() {
+async function computeAllDailyBalances(branchId) {
   const [cashSalesByDay, creditPaymentsByDay, entriesByDay, expensesByDay] = await Promise.all([
     // Immediate-payment sales enter the report on the sale date.
     Sale.aggregate([
       {
-        $match: {
+        $match: scopedFilter({
           status: { $nin: ["voided", "corrected", "cancelled", "refunded"] },
           type: { $ne: "expense" },
           paymentType: { $ne: "credit" },
-        },
+        }, branchId),
       },
       {
         $group: {
@@ -39,11 +40,11 @@ async function computeAllDailyBalances() {
     // enters cash revenue, on its confirmation date (not the invoice date).
     Sale.aggregate([
       {
-        $match: {
+        $match: scopedFilter({
           status: { $nin: ["voided", "corrected", "cancelled", "refunded"] },
           type: { $ne: "expense" },
           paymentType: "credit",
-        },
+        }, branchId),
       },
       { $unwind: "$creditDetails.payments" },
       {
@@ -77,7 +78,7 @@ async function computeAllDailyBalances() {
 
     // Entries (cash received): active status only
     Entry.aggregate([
-      { $match: { status: "active" } },
+      { $match: scopedFilter({ status: "active" }, branchId) },
       {
         $group: {
           _id: {
@@ -92,7 +93,7 @@ async function computeAllDailyBalances() {
 
     // Expenses (cash out): validated status only
     Expense.aggregate([
-      { $match: { status: "validated" } },
+      { $match: scopedFilter({ status: "validated" }, branchId) },
       {
         $group: {
           _id: {
@@ -162,7 +163,7 @@ router.get("/daily-balance", authMiddleware, async (req, res) => {
   try {
     const { from, to } = req.query;
 
-    const { allDays, currentBalance } = await computeAllDailyBalances();
+    const { allDays, currentBalance } = await computeAllDailyBalances(req.branchId);
 
     // Slice to the requested period
     const displayDays = allDays.filter((day) => {
@@ -200,6 +201,7 @@ router.get("/daily-balance", authMiddleware, async (req, res) => {
 
     res.json({
       success: true,
+      branch: BRANCHES.find((branch) => branch.id === req.branchId),
       days: displayDays,
       periodSummary: {
         openingBalance: periodOpeningBalance,

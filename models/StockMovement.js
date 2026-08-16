@@ -2,6 +2,12 @@ const mongoose = require("mongoose");
 
 const stockMovementSchema = new mongoose.Schema(
   {
+    branchId: {
+      type: String,
+      enum: ["butembo", "beni"],
+      default: "butembo",
+      index: true,
+    },
     productId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "Product",
@@ -14,7 +20,7 @@ const stockMovementSchema = new mongoose.Schema(
     },
     type: {
       type: String,
-      enum: ["loan", "loan_return", "bonus_manual", "adjustment_in", "adjustment_out", "car_arrival", "transfer_out"],
+      enum: ["loan", "loan_return", "bonus_manual", "adjustment_in", "adjustment_out", "car_arrival", "transfer_out", "sale", "reception"],
       required: true,
     },
     quantity: {
@@ -72,6 +78,9 @@ const stockMovementSchema = new mongoose.Schema(
       ref: "User",
       default: null,
     },
+    recordedByRole: { type: String, trim: true, default: "" },
+    previousStock: { type: Number, min: 0, default: undefined },
+    newStock: { type: Number, min: 0, default: undefined },
   },
   {
     timestamps: true,

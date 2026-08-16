@@ -4,6 +4,8 @@ const router = express.Router();
 const User = require("../models/User");
 const bcrypt = require("bcryptjs");
 const generateToken = require("../utils/generateToken");
+const authMiddleware = require("../middleware/auth");
+const { BRANCHES, normalizeBranchId } = require("../utils/branchContext");
 
 // Helper: basic field guard
 function required(...fields) {
@@ -16,7 +18,7 @@ function isBcryptHash(value) {
 
 router.post("/register", async (req, res) => {
   try {
-    let { username, email, password, role } = req.body || {};
+    let { username, email, password } = req.body || {};
     username = (username || "").trim();
     email = (email || "").trim().toLowerCase();
     password = String(password || "");
@@ -40,7 +42,8 @@ router.post("/register", async (req, res) => {
       username,
       email,
       password: hashedPassword,
-      role, // optional, depends on your schema defaults/validation
+      role: "staff",
+      branchId: "butembo",
     });
 
     // Keep response minimal for register; client will switch to login
@@ -96,6 +99,8 @@ router.post("/login", async (req, res) => {
       username: user.username,
       email: user.email,
       role: user.role,
+      branchId: normalizeBranchId(user.branchId),
+      isSuperAdmin: user.role === "admin" || user.role === "superadmin",
       createdAt: user.createdAt,
       updatedAt: user.updatedAt,
     };
@@ -108,6 +113,15 @@ router.post("/login", async (req, res) => {
     console.error("Error logging in user:", error);
     return res.status(500).json({ message: "Internal server error" });
   }
+});
+
+router.get("/branches", authMiddleware, (req, res) => {
+  res.json({
+    branches: BRANCHES,
+    activeBranchId: req.branchId,
+    assignedBranchId: req.user.branchId,
+    canSwitchBranch: req.user.isSuperAdmin,
+  });
 });
 
 module.exports = router;

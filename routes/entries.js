@@ -3,6 +3,7 @@ const router = express.Router();
 const mongoose = require("mongoose");
 const Entry = require("../models/Entry");
 const authMiddleware = require("../middleware/auth");
+const { scopedFilter } = require("../utils/branchContext");
 
 // ==================== TIME FRAME HELPER FUNCTIONS ====================
 
@@ -236,7 +237,7 @@ router.get("/", authMiddleware, async (req, res) => {
     }
 
     // Execute query - get ALL records within timeframe (no skip/limit)
-    const entries = await Entry.find(filter)
+    const entries = await Entry.find(scopedFilter(filter, req.branchId))
       .populate("createdBy", "username email")
       .populate("updatedBy", "username")
       .select('-__v') // Exclude version key
@@ -394,6 +395,7 @@ router.post("/", authMiddleware, async (req, res) => {
       .toUpperCase()}`;
 
     const entryData = {
+      branchId: req.branchId,
       entryId,
       amount: entryAmount,
       source: source.trim(),
@@ -429,7 +431,7 @@ router.get("/:id", authMiddleware, async (req, res) => {
   try {
     const entryId = req.params.id;
     
-    const entry = await Entry.findById(entryId)
+    const entry = await Entry.findOne(scopedFilter({ _id: entryId }, req.branchId))
       .populate("createdBy", "username email")
       .populate("updatedBy", "username")
       .populate("editHistory.editedBy", "username email");
@@ -452,7 +454,7 @@ router.get("/:id", authMiddleware, async (req, res) => {
 router.put("/:id", authMiddleware, async (req, res) => {
   try {
     // Check if user is admin
-    if (req.user.role !== "admin") {
+    if (!req.user.isSuperAdmin) {
       return res.status(403).json({ 
         error: "Access denied. Only administrators can edit entries." 
       });
@@ -492,7 +494,7 @@ router.put("/:id", authMiddleware, async (req, res) => {
     }
 
     // Find the original entry
-    const originalEntry = await Entry.findById(id);
+    const originalEntry = await Entry.findOne(scopedFilter({ _id: id }, req.branchId));
     if (!originalEntry) {
       return res.status(404).json({ error: "Entry not found" });
     }
@@ -554,8 +556,8 @@ router.put("/:id", authMiddleware, async (req, res) => {
       });
     }
 
-    const updatedEntry = await Entry.findByIdAndUpdate(
-      id,
+    const updatedEntry = await Entry.findOneAndUpdate(
+      scopedFilter({ _id: id }, req.branchId),
       {
         amount: entryAmount,
         source: source.trim(),
@@ -599,13 +601,13 @@ router.put("/:id", authMiddleware, async (req, res) => {
 router.delete("/:id", authMiddleware, async (req, res) => {
   try {
     // Check if user is admin
-    if (req.user.role !== "admin") {
+    if (!req.user.isSuperAdmin) {
       return res.status(403).json({ 
         error: "Access denied. Only administrators can delete entries." 
       });
     }
 
-    const entry = await Entry.findById(req.params.id);
+    const entry = await Entry.findOne(scopedFilter({ _id: req.params.id }, req.branchId));
     
     if (!entry) {
       return res.status(404).json({ error: "Entry not found" });
@@ -616,8 +618,8 @@ router.delete("/:id", authMiddleware, async (req, res) => {
     }
 
     // Soft delete
-    const deletedEntry = await Entry.findByIdAndUpdate(
-      req.params.id,
+    const deletedEntry = await Entry.findOneAndUpdate(
+      scopedFilter({ _id: req.params.id }, req.branchId),
       {
         status: "deleted",
         deletedBy: req.user.userId,
@@ -645,13 +647,13 @@ router.delete("/:id", authMiddleware, async (req, res) => {
 router.patch("/:id/restore", authMiddleware, async (req, res) => {
   try {
     // Check if user is admin
-    if (req.user.role !== "admin") {
+    if (!req.user.isSuperAdmin) {
       return res.status(403).json({ 
         error: "Access denied. Only administrators can restore entries." 
       });
     }
 
-    const entry = await Entry.findById(req.params.id);
+    const entry = await Entry.findOne(scopedFilter({ _id: req.params.id }, req.branchId));
     
     if (!entry) {
       return res.status(404).json({ error: "Entry not found" });
@@ -661,8 +663,8 @@ router.patch("/:id/restore", authMiddleware, async (req, res) => {
       return res.status(400).json({ error: "Entry is not deleted" });
     }
 
-    const restoredEntry = await Entry.findByIdAndUpdate(
-      req.params.id,
+    const restoredEntry = await Entry.findOneAndUpdate(
+      scopedFilter({ _id: req.params.id }, req.branchId),
       {
         status: "active",
         deletedBy: null,
@@ -699,10 +701,10 @@ router.get("/stats/daily", authMiddleware, async (req, res) => {
 
     const dailyEntries = await Entry.aggregate([
       {
-        $match: {
+        $match: scopedFilter({
           createdAt: { $gte: startOfDay, $lte: endOfDay },
           status: "active"
-        },
+        }, req.branchId),
       },
       {
         $group: {
@@ -720,10 +722,10 @@ router.get("/stats/daily", authMiddleware, async (req, res) => {
       },
     ]);
 
-    const entries = await Entry.find({
+    const entries = await Entry.find(scopedFilter({
       createdAt: { $gte: startOfDay, $lte: endOfDay },
       status: "active"
-    })
+    }, req.branchId))
     .populate("createdBy", "username email")
     .sort({ createdAt: -1 })
     .lean();
@@ -774,7 +776,7 @@ router.get("/stats/summary", authMiddleware, async (req, res) => {
     timeframeFilter.status = "active";
 
     const stats = await Entry.aggregate([
-      { $match: timeframeFilter },
+      { $match: scopedFilter(timeframeFilter, req.branchId) },
       {
         $group: {
           _id: null,
@@ -788,7 +790,7 @@ router.get("/stats/summary", authMiddleware, async (req, res) => {
     ]);
 
     const categoryStats = await Entry.aggregate([
-      { $match: timeframeFilter },
+      { $match: scopedFilter(timeframeFilter, req.branchId) },
       {
         $group: {
           _id: "$category",
@@ -801,7 +803,7 @@ router.get("/stats/summary", authMiddleware, async (req, res) => {
     ]);
 
     const sourceStats = await Entry.aggregate([
-      { $match: timeframeFilter },
+      { $match: scopedFilter(timeframeFilter, req.branchId) },
       {
         $group: {
           _id: "$source",
@@ -814,7 +816,7 @@ router.get("/stats/summary", authMiddleware, async (req, res) => {
     ]);
 
     const paymentMethodStats = await Entry.aggregate([
-      { $match: timeframeFilter },
+      { $match: scopedFilter(timeframeFilter, req.branchId) },
       {
         $group: {
           _id: "$paymentMethod",
@@ -828,7 +830,7 @@ router.get("/stats/summary", authMiddleware, async (req, res) => {
 
     // Get daily breakdown for the timeframe
     const dailyBreakdown = await Entry.aggregate([
-      { $match: timeframeFilter },
+      { $match: scopedFilter(timeframeFilter, req.branchId) },
       {
         $group: {
           _id: {
@@ -846,7 +848,7 @@ router.get("/stats/summary", authMiddleware, async (req, res) => {
     ]);
 
     // Get top entries
-    const topEntries = await Entry.find(timeframeFilter)
+    const topEntries = await Entry.find(scopedFilter(timeframeFilter, req.branchId))
       .populate("createdBy", "username email")
       .sort({ amount: -1 })
       .limit(10)
@@ -855,7 +857,7 @@ router.get("/stats/summary", authMiddleware, async (req, res) => {
 
     // Get most frequent sources
     const frequentSources = await Entry.aggregate([
-      { $match: timeframeFilter },
+      { $match: scopedFilter(timeframeFilter, req.branchId) },
       {
         $group: {
           _id: "$source",
@@ -921,7 +923,7 @@ router.get("/category/:category", authMiddleware, async (req, res) => {
     timeframeFilter.category = category;
     timeframeFilter.status = "active";
 
-    const entries = await Entry.find(timeframeFilter)
+    const entries = await Entry.find(scopedFilter(timeframeFilter, req.branchId))
       .populate("createdBy", "username email")
       .sort({ createdAt: -1 })
       .lean();
@@ -965,7 +967,7 @@ router.get("/source/:source", authMiddleware, async (req, res) => {
     timeframeFilter.source = source;
     timeframeFilter.status = "active";
 
-    const entries = await Entry.find(timeframeFilter)
+    const entries = await Entry.find(scopedFilter(timeframeFilter, req.branchId))
       .populate("createdBy", "username email")
       .sort({ createdAt: -1 })
       .lean();
@@ -1009,7 +1011,7 @@ router.get("/payment/:method", authMiddleware, async (req, res) => {
     timeframeFilter.paymentMethod = method;
     timeframeFilter.status = "active";
 
-    const entries = await Entry.find(timeframeFilter)
+    const entries = await Entry.find(scopedFilter(timeframeFilter, req.branchId))
       .populate("createdBy", "username email")
       .sort({ createdAt: -1 })
       .lean();
@@ -1051,7 +1053,7 @@ router.get("/user/me", authMiddleware, async (req, res) => {
     timeframeFilter.createdBy = req.user.userId;
     timeframeFilter.status = "active";
 
-    const entries = await Entry.find(timeframeFilter)
+    const entries = await Entry.find(scopedFilter(timeframeFilter, req.branchId))
       .populate("createdBy", "username email")
       .sort({ createdAt: -1 })
       .lean();
@@ -1080,9 +1082,9 @@ router.get("/permissions/me", authMiddleware, async (req, res) => {
   try {
     const permissions = {
       canCreate: true, // Everyone can create entries
-      canEdit: req.user.role === "admin",
-      canDelete: req.user.role === "admin",
-      canRestore: req.user.role === "admin",
+      canEdit: req.user.isSuperAdmin,
+      canDelete: req.user.isSuperAdmin,
+      canRestore: req.user.isSuperAdmin,
       role: req.user.role,
       userId: req.user.userId,
       userName: req.user.username || req.user.email || "User"
@@ -1098,7 +1100,7 @@ router.get("/permissions/me", authMiddleware, async (req, res) => {
 /** ---------- GET ENTRIES HISTORY/AUDIT LOG ---------- */
 router.get("/:id/history", authMiddleware, async (req, res) => {
   try {
-    const entry = await Entry.findById(req.params.id)
+    const entry = await Entry.findOne(scopedFilter({ _id: req.params.id }, req.branchId))
       .populate("editHistory.editedBy", "username email");
 
     if (!entry) {

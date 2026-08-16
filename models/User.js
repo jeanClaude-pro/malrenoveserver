@@ -20,13 +20,18 @@ const userSchema = new mongoose.Schema(
     },
     role: {
       type: String,
-      enum: ["admin", "manager", "inventory_manager", "cashier_supervisor", "staff"],
+      enum: ["admin", "superadmin", "manager", "inventory_manager", "cashier_supervisor", "staff"],
       default: "staff",
+    },
+    branchId: {
+      type: String,
+      enum: ["butembo", "beni"],
+      default: "butembo",
     },
     isActive: {
       type: Boolean,
       default: true,
-    }
+    },
   },
   { timestamps: true }
 );
