@@ -38,9 +38,13 @@ function scopedFilter(filter, branchId, field = "branchId") {
 // requests can never drive stock below zero.
 async function adjustBranchStock({ productId, branchId, delta, session, requireAvailable = false }) {
   const id = normalizeBranchId(branchId);
-  const filter = { _id: productId, branchId: id };
-  if (requireAvailable && delta < 0) filter.stock = { $gte: Math.abs(delta) };
-  let query = Product.findOneAndUpdate(filter, { $inc: { stock: delta } }, { new: true });
+  const productFilter = { _id: productId };
+  if (requireAvailable && delta < 0) productFilter.stock = { $gte: Math.abs(delta) };
+  // scopedFilter (not a plain branchId equality) so a legacy product that
+  // predates the branch-ownership migration — still matched by every read
+  // path via branchScope's missing/null fallback — isn't invisible to writes
+  // too, which would otherwise surface as a false "stock changed" conflict.
+  let query = Product.findOneAndUpdate(scopedFilter(productFilter, id), { $inc: { stock: delta } }, { new: true });
   if (session) query = query.session(session);
   return query;
 }

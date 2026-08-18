@@ -388,9 +388,12 @@ router.post("/:id/sell", authMiddleware, async (req, res) => {
       });
     }
 
-    // Update stock atomically (reduce by quantity sold, guarded against races)
+    // Update stock atomically (reduce by quantity sold, guarded against races).
+    // scopedFilter (not a plain branchId equality) so a legacy product that
+    // predates the branch-ownership migration is still matched here the same
+    // way it already is on every read path.
     const updatedProduct = await Product.findOneAndUpdate(
-      { _id: product._id, branchId: req.branchId, stock: { $gte: quantity } },
+      scopedFilter({ _id: product._id, stock: { $gte: quantity } }, req.branchId),
       { $inc: { stock: -quantity } },
       { new: true }
     );
