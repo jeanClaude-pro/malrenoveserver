@@ -5,12 +5,7 @@ const Product = require("../models/Product");
 const StockMovement = require("../models/StockMovement");
 const authMiddleware = require("../middleware/auth");
 const isAdmin = require("../middleware/isAdmin");
-const {
-  getBranchStock,
-  productForBranch,
-  setBranchStock,
-  adjustBranchStock,
-} = require("../utils/branchContext");
+const { scopedFilter } = require("../utils/branchContext");
 
 function toNonNegativeInteger(value, fallback = 0) {
   const number = Number(value);
@@ -60,9 +55,8 @@ function buildStockPayload(body, existingProduct = null) {
   return { stock, minStock, piecesPerCarton };
 }
 
-// GET /api/products - Get all products with optional filtering
+// GET /api/products - Get all products for the active branch
 router.get("/", authMiddleware, async (req, res) => {
-  console.log("Fetching products with filters:", req.query);
   try {
     const { search, category, status } = req.query;
 
@@ -81,24 +75,28 @@ router.get("/", authMiddleware, async (req, res) => {
       filter.status = status;
     }
 
-    const products = await Product.find(filter).sort({ createdAt: -1 }).lean();
-    res.json(products.map((product) => productForBranch(product, req.branchId)));
+    const products = await Product.find(scopedFilter(filter, req.branchId))
+      .sort({ createdAt: -1 })
+      .lean();
+    res.json(products);
   } catch (error) {
     console.error("Error fetching products:", error);
     res.status(500).json({ error: "Failed to fetch products" });
   }
 });
 
-// GET /api/products/:id - Get a single product by ID
+// GET /api/products/:id - Get a single product by ID (within the active branch)
 router.get("/:id", authMiddleware, async (req, res) => {
   try {
-    const product = await Product.findById(req.params.id);
+    const product = await Product.findOne(
+      scopedFilter({ _id: req.params.id }, req.branchId)
+    );
 
     if (!product) {
       return res.status(404).json({ error: "Product not found" });
     }
 
-    res.json(productForBranch(product, req.branchId));
+    res.json(product);
   } catch (error) {
     console.error("Error fetching product:", error);
 
@@ -110,7 +108,7 @@ router.get("/:id", authMiddleware, async (req, res) => {
   }
 });
 
-// POST /api/products - Create a new product
+// POST /api/products - Create a new product in the active branch
 router.post("/", authMiddleware, isAdmin, async (req, res) => {
   try {
     const {
@@ -156,12 +154,12 @@ router.post("/", authMiddleware, isAdmin, async (req, res) => {
     }
 
     const product = new Product({
+      branchId: req.branchId,
       name: safeName,
       description: sanitizeText(description, 500),
       category: safeCategory,
       brand: sanitizeText(brand, 80),
-      stock: req.branchId === "butembo" ? stockPayload.stock : 0,
-      branchStock: { [req.branchId]: stockPayload.stock },
+      stock: stockPayload.stock,
       minStock: stockPayload.minStock,
       piecesPerCarton: stockPayload.piecesPerCarton,
       unit: sanitizeText(unit, 30) || "pièce",
@@ -170,7 +168,7 @@ router.post("/", authMiddleware, isAdmin, async (req, res) => {
     });
 
     const savedProduct = await product.save();
-    res.status(201).json(productForBranch(savedProduct, req.branchId));
+    res.status(201).json(savedProduct);
   } catch (error) {
     console.error("Error creating product:", error);
 
@@ -183,7 +181,7 @@ router.post("/", authMiddleware, isAdmin, async (req, res) => {
   }
 });
 
-// PUT /api/products/:id - Update a product
+// PUT /api/products/:id - Update a product (within the active branch)
 router.put("/:id", authMiddleware, isAdmin, async (req, res) => {
   const session = await mongoose.startSession();
   try {
@@ -205,7 +203,9 @@ router.put("/:id", authMiddleware, isAdmin, async (req, res) => {
       reason,
     } = req.body;
 
-    const existingProduct = await Product.findById(req.params.id);
+    const existingProduct = await Product.findOne(
+      scopedFilter({ _id: req.params.id }, req.branchId)
+    );
     if (!existingProduct) {
       return res.status(404).json({ error: "Product not found" });
     }
@@ -234,25 +234,20 @@ router.put("/:id", authMiddleware, isAdmin, async (req, res) => {
       minStockCartons !== undefined ||
       minStockPieces !== undefined
     ) {
-      const stockPayload = buildStockPayload({
-        stock,
-        minStock,
-        piecesPerCarton,
-        cartonStock,
-        loosePieces,
-        minStockCartons,
-        minStockPieces,
-      }, { ...existingProduct.toObject(), stock: getBranchStock(existingProduct, req.branchId) });
+      const stockPayload = buildStockPayload(
+        { stock, minStock, piecesPerCarton, cartonStock, loosePieces, minStockCartons, minStockPieces },
+        existingProduct
+      );
 
       if (stockPayload.error) {
         return res.status(400).json({ error: stockPayload.error });
       }
 
-      updateData.branchStockValue = stockPayload.stock;
+      updateData.stock = stockPayload.stock;
       updateData.minStock = stockPayload.minStock;
       updateData.piecesPerCarton = stockPayload.piecesPerCarton;
     }
-    if (unit !== undefined) updateData.unit = sanitizeText(unit, 30) || "piÃ¨ce";
+    if (unit !== undefined) updateData.unit = sanitizeText(unit, 30) || "pièce";
     if (weight !== undefined) updateData.weight = Math.max(0, Number(weight) || 0);
     if (status !== undefined) {
       if (!["active", "inactive"].includes(status)) {
@@ -261,28 +256,16 @@ router.put("/:id", authMiddleware, isAdmin, async (req, res) => {
       updateData.status = status;
     }
 
-    const previousBranchStock = getBranchStock(existingProduct, req.branchId);
-    const stockDelta = updateData.branchStockValue !== undefined
-      ? updateData.branchStockValue - previousBranchStock
-      : 0;
+    const previousStock = existingProduct.stock;
+    const stockDelta = updateData.stock !== undefined ? updateData.stock - previousStock : 0;
 
     let updatedProduct;
     await session.withTransaction(async () => {
-      const branchStockValue = updateData.branchStockValue;
-      delete updateData.branchStockValue;
-      updatedProduct = branchStockValue !== undefined
-        ? await setBranchStock({
-            productId: req.params.id,
-            branchId: req.branchId,
-            value: branchStockValue,
-            session,
-            extraUpdates: updateData,
-          })
-        : await Product.findByIdAndUpdate(
-            req.params.id,
-            updateData,
-            { new: true, runValidators: true, session }
-          );
+      updatedProduct = await Product.findOneAndUpdate(
+        scopedFilter({ _id: req.params.id }, req.branchId),
+        updateData,
+        { new: true, runValidators: true, session }
+      );
 
       if (!updatedProduct) {
         const notFound = new Error("Product not found");
@@ -305,8 +288,8 @@ router.put("/:id", authMiddleware, isAdmin, async (req, res) => {
               recordedByUserId: req.user.userId,
               recordedByRole: req.user.role,
               branchId: req.branchId,
-              previousStock: previousBranchStock,
-              newStock: previousBranchStock + stockDelta,
+              previousStock,
+              newStock: previousStock + stockDelta,
             },
           ],
           { session }
@@ -314,7 +297,7 @@ router.put("/:id", authMiddleware, isAdmin, async (req, res) => {
       }
     });
 
-    res.json(productForBranch(updatedProduct, req.branchId));
+    res.json(updatedProduct);
   } catch (error) {
     console.error("Error updating product:", error);
 
@@ -343,8 +326,8 @@ router.put("/:id", authMiddleware, isAdmin, async (req, res) => {
 // via PUT { status: "active" }.
 router.delete("/:id", authMiddleware, isAdmin, async (req, res) => {
   try {
-    const deactivatedProduct = await Product.findByIdAndUpdate(
-      req.params.id,
+    const deactivatedProduct = await Product.findOneAndUpdate(
+      scopedFilter({ _id: req.params.id }, req.branchId),
       { status: "inactive" },
       { new: true }
     );
@@ -353,7 +336,7 @@ router.delete("/:id", authMiddleware, isAdmin, async (req, res) => {
       return res.status(404).json({ error: "Product not found" });
     }
 
-    res.json({ message: "Product deactivated successfully", product: productForBranch(deactivatedProduct, req.branchId) });
+    res.json({ message: "Product deactivated successfully", product: deactivatedProduct });
   } catch (error) {
     console.error("Error deactivating product:", error);
 
@@ -368,17 +351,19 @@ router.delete("/:id", authMiddleware, isAdmin, async (req, res) => {
 // POST /api/products/:id/sell - Special endpoint for selling products
 router.post("/:id/sell", authMiddleware, async (req, res) => {
   try {
-    // Find the product
-    const product = await Product.findById(req.params.id);
-    
+    // Find the product within the active branch
+    const product = await Product.findOne(
+      scopedFilter({ _id: req.params.id }, req.branchId)
+    );
+
     if (!product) {
       return res.status(404).json({ error: "Product not found" });
     }
 
     // Check if product is active
     if (product.status !== "active") {
-      return res.status(400).json({ 
-        error: "Cannot sell inactive product" 
+      return res.status(400).json({
+        error: "Cannot sell inactive product"
       });
     }
 
@@ -387,7 +372,7 @@ router.post("/:id/sell", authMiddleware, async (req, res) => {
     const loosePieces = toNonNegativeInteger(req.body.loosePieces ?? req.body.pieces, 0);
     if (loosePieces >= piecesPerCarton) {
       return res.status(400).json({
-        error: `Les piÃ¨ces doivent Ãªtre infÃ©rieures Ã  ${piecesPerCarton}`,
+        error: `Les pièces doivent être inférieures à ${piecesPerCarton}`,
       });
     }
     const quantity =
@@ -396,20 +381,19 @@ router.post("/:id/sell", authMiddleware, async (req, res) => {
         : toPositiveInteger(req.body.quantity, 1);
 
     // Check stock availability
-    const availableStock = getBranchStock(product, req.branchId);
+    const availableStock = product.stock;
     if (availableStock < quantity) {
-      return res.status(400).json({ 
-        error: `Stock insuffisant. Disponible: ${availableStock} pièce(s)` 
+      return res.status(400).json({
+        error: `Stock insuffisant. Disponible: ${availableStock} pièce(s)`
       });
     }
 
-    // Update stock (reduce by quantity sold)
-    const updatedProduct = await adjustBranchStock({
-      productId: product._id,
-      branchId: req.branchId,
-      delta: -quantity,
-      requireAvailable: true,
-    });
+    // Update stock atomically (reduce by quantity sold, guarded against races)
+    const updatedProduct = await Product.findOneAndUpdate(
+      { _id: product._id, branchId: req.branchId, stock: { $gte: quantity } },
+      { $inc: { stock: -quantity } },
+      { new: true }
+    );
     if (!updatedProduct) {
       return res.status(409).json({ error: "Stock changed. Please refresh and retry." });
     }
@@ -436,7 +420,7 @@ router.post("/:id/sell", authMiddleware, async (req, res) => {
         productId: product._id,
         productName: product.name,
         quantity: quantity,
-        remainingStock: getBranchStock(updatedProduct, req.branchId)
+        remainingStock: updatedProduct.stock
       }
     });
 

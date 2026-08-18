@@ -2,6 +2,12 @@ const mongoose = require("mongoose");
 
 const productSchema = new mongoose.Schema(
   {
+    branchId: {
+      type: String,
+      enum: ["butembo", "beni"],
+      default: "butembo",
+      index: true,
+    },
     name: {
       type: String,
       required: true,
@@ -31,13 +37,6 @@ const productSchema = new mongoose.Schema(
       required: true,
       min: 0,
       default: 0,
-    },
-    // Branch inventory. Legacy `stock` remains the Butembo compatibility value;
-    // records created before multi-branch support need no destructive migration.
-    branchStock: {
-      type: Map,
-      of: { type: Number, min: 0 },
-      default: undefined,
     },
     piecesPerCarton: {
       type: Number,
@@ -78,6 +77,7 @@ const productSchema = new mongoose.Schema(
 productSchema.index({ name: "text", description: "text", brand: "text" });
 //productSchema.index({ category: 1 });
 productSchema.index({ status: 1 });
+productSchema.index({ branchId: 1, status: 1 });
 
 // Reuse if it already exists (prevents OverwriteModelError)
 const Product =

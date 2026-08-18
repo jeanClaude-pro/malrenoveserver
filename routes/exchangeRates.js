@@ -2,15 +2,16 @@ const express = require("express");
 const router = express.Router();
 const ExchangeRate = require("../models/ExchangeRate");
 const authMiddleware = require("../middleware/auth");
+const { scopedFilter } = require("../utils/branchContext");
 
-// GET current active exchange rate
+// GET current active exchange rate for the active branch
 router.get("/current", authMiddleware, async (req, res) => {
   try {
-    const currentRate = await ExchangeRate.getCurrentRate();
-    
+    const currentRate = await ExchangeRate.getCurrentRate(req.branchId);
+
     if (!currentRate) {
-      return res.status(404).json({ 
-        error: "No active exchange rate found" 
+      return res.status(404).json({
+        error: "No active exchange rate found"
       });
     }
 
@@ -26,18 +27,18 @@ router.get("/current", authMiddleware, async (req, res) => {
   }
 });
 
-// GET exchange rate history (Admin only)
+// GET exchange rate history for the active branch (Admin only)
 router.get("/history", authMiddleware, async (req, res) => {
   try {
     // Check if user is admin
     if (!req.user.isSuperAdmin && req.user.role !== "manager") {
-      return res.status(403).json({ 
-        error: "Only admins and managers can view rate history" 
+      return res.status(403).json({
+        error: "Only admins and managers can view rate history"
       });
     }
 
     const { limit = 50 } = req.query;
-    const history = await ExchangeRate.getRateHistory(parseInt(limit));
+    const history = await ExchangeRate.getRateHistory(parseInt(limit), req.branchId);
 
     res.json({
       history,
@@ -49,13 +50,13 @@ router.get("/history", authMiddleware, async (req, res) => {
   }
 });
 
-// CREATE new exchange rate (Admin only)
+// CREATE new exchange rate for the active branch (Admin only)
 router.post("/", authMiddleware, async (req, res) => {
   try {
     // Check if user is admin
     if (!req.user.isSuperAdmin && req.user.role !== "manager") {
-      return res.status(403).json({ 
-        error: "Only admins and managers can set exchange rates" 
+      return res.status(403).json({
+        error: "Only admins and managers can set exchange rates"
       });
     }
 
@@ -63,19 +64,21 @@ router.post("/", authMiddleware, async (req, res) => {
 
     // Validate required fields
     if (!rate || rate <= 0) {
-      return res.status(400).json({ 
-        error: "Valid exchange rate is required" 
+      return res.status(400).json({
+        error: "Valid exchange rate is required"
       });
     }
 
-    // Deactivate all previous rates
+    // Deactivate all previous rates for this branch only — the other branch's
+    // active rate must stay untouched.
     await ExchangeRate.updateMany(
-      { isActive: true },
+      scopedFilter({ isActive: true }, req.branchId),
       { isActive: false }
     );
 
     // Create new active rate
     const newRate = new ExchangeRate({
+      branchId: req.branchId,
       rate: parseFloat(rate),
       effectiveFrom: effectiveFrom ? new Date(effectiveFrom) : new Date(),
       createdBy: req.user.userId,
@@ -90,38 +93,38 @@ router.post("/", authMiddleware, async (req, res) => {
     });
   } catch (error) {
     console.error("Error creating exchange rate:", error);
-    
+
     if (error.name === "ValidationError") {
       const errors = Object.values(error.errors).map(e => e.message);
       return res.status(400).json({ error: errors.join(", ") });
     }
-    
+
     res.status(500).json({ error: "Failed to update exchange rate" });
   }
 });
 
-// UPDATE exchange rate (Admin only)
+// UPDATE exchange rate (Admin only, within the active branch)
 router.put("/:id", authMiddleware, async (req, res) => {
   try {
     // Check if user is admin
     if (!req.user.isSuperAdmin && req.user.role !== "manager") {
-      return res.status(403).json({ 
-        error: "Only admins and managers can update exchange rates" 
+      return res.status(403).json({
+        error: "Only admins and managers can update exchange rates"
       });
     }
 
     const { id } = req.params;
     const { rate, notes } = req.body;
 
-    const existingRate = await ExchangeRate.findById(id);
+    const existingRate = await ExchangeRate.findOne(scopedFilter({ _id: id }, req.branchId));
     if (!existingRate) {
       return res.status(404).json({ error: "Exchange rate not found" });
     }
 
     // Validate rate if provided
     if (rate && rate <= 0) {
-      return res.status(400).json({ 
-        error: "Valid exchange rate is required" 
+      return res.status(400).json({
+        error: "Valid exchange rate is required"
       });
     }
 
@@ -137,33 +140,33 @@ router.put("/:id", authMiddleware, async (req, res) => {
     });
   } catch (error) {
     console.error("Error updating exchange rate:", error);
-    
+
     if (error.name === "ValidationError") {
       const errors = Object.values(error.errors).map(e => e.message);
       return res.status(400).json({ error: errors.join(", ") });
     }
-    
+
     if (error.name === "CastError") {
       return res.status(400).json({ error: "Invalid exchange rate ID" });
     }
-    
+
     res.status(500).json({ error: "Failed to update exchange rate" });
   }
 });
 
-// DEACTIVATE exchange rate (Admin only)
+// DEACTIVATE exchange rate (Admin only, within the active branch)
 router.patch("/:id/deactivate", authMiddleware, async (req, res) => {
   try {
     // Check if user is admin
     if (!req.user.isSuperAdmin && req.user.role !== "manager") {
-      return res.status(403).json({ 
-        error: "Only admins and managers can deactivate exchange rates" 
+      return res.status(403).json({
+        error: "Only admins and managers can deactivate exchange rates"
       });
     }
 
     const { id } = req.params;
 
-    const rate = await ExchangeRate.findById(id);
+    const rate = await ExchangeRate.findOne(scopedFilter({ _id: id }, req.branchId));
     if (!rate) {
       return res.status(404).json({ error: "Exchange rate not found" });
     }
@@ -180,11 +183,11 @@ router.patch("/:id/deactivate", authMiddleware, async (req, res) => {
     });
   } catch (error) {
     console.error("Error deactivating exchange rate:", error);
-    
+
     if (error.name === "CastError") {
       return res.status(400).json({ error: "Invalid exchange rate ID" });
     }
-    
+
     res.status(500).json({ error: "Failed to deactivate exchange rate" });
   }
 });

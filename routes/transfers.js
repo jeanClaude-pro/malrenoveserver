@@ -7,7 +7,7 @@ const Product = require("../models/Product");
 const StockMovement = require("../models/StockMovement");
 const TransferReception = require("../models/TransferReception");
 const authMiddleware = require("../middleware/auth");
-const { scopedFilter, getBranchStock, adjustBranchStock } = require("../utils/branchContext");
+const { scopedFilter, adjustBranchStock } = require("../utils/branchContext");
 
 // Helper function to generate a unique transfer ID
 function generateTransferId() {
@@ -76,8 +76,8 @@ function computeTotalPieces(product) {
 // reserve or deduct anything.
 async function hasEnoughStock(productId, totalPieces, branchId) {
   if (!productId || totalPieces <= 0) return true;
-  const product = await Product.findById(productId).lean();
-  return !!product && getBranchStock(product, branchId) >= totalPieces;
+  const product = await Product.findOne(scopedFilter({ _id: productId }, branchId)).lean();
+  return !!product && product.stock >= totalPieces;
 }
 
 // ==================== GET ALL TRANSFERS (with filters) ====================
@@ -378,8 +378,10 @@ router.patch("/:id/confirm-delivery", authMiddleware, async (req, res) => {
       }
 
       // The stock predicate makes the subtraction safe even if two requests race.
-      const current = await Product.findById(transfer.product.productId).session(session).lean();
-      const previousStock = getBranchStock(current, req.branchId);
+      const current = await Product.findOne(
+        scopedFilter({ _id: transfer.product.productId }, req.branchId)
+      ).session(session).lean();
+      const previousStock = current?.stock || 0;
       const product = current?.status === "active" ? await adjustBranchStock({
         productId: transfer.product.productId,
         branchId: req.branchId,
@@ -430,7 +432,7 @@ router.patch("/:id/confirm-delivery", authMiddleware, async (req, res) => {
       }], { session });
 
       deliveredTransfer = transfer;
-      remainingStock = getBranchStock(product, req.branchId);
+      remainingStock = product.stock;
     });
 
     res.json({

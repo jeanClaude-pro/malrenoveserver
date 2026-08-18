@@ -1,6 +1,13 @@
 const mongoose = require("mongoose");
+const { branchScope } = require("../utils/branchContext");
 
 const exchangeRateSchema = new mongoose.Schema({
+  branchId: {
+    type: String,
+    enum: ["butembo", "beni"],
+    default: "butembo",
+    index: true,
+  },
   rate: {
     type: Number,
     required: true,
@@ -34,20 +41,21 @@ const exchangeRateSchema = new mongoose.Schema({
 // Index for efficient queries
 exchangeRateSchema.index({ isActive: 1 });
 exchangeRateSchema.index({ effectiveFrom: -1 });
+exchangeRateSchema.index({ branchId: 1, isActive: 1 });
 
-// Static method to get current active rate
-exchangeRateSchema.statics.getCurrentRate = function() {
-  return this.findOne({ isActive: true }).sort({ effectiveFrom: -1 });
+// Static method to get current active rate for a branch
+exchangeRateSchema.statics.getCurrentRate = function(branchId) {
+  return this.findOne({ $and: [{ isActive: true }, branchScope(branchId)] }).sort({ effectiveFrom: -1 });
 };
 
-// Static method to get rate history
-exchangeRateSchema.statics.getRateHistory = function(limit = 50) {
-  return this.find().sort({ effectiveFrom: -1 }).limit(limit).populate('createdBy', 'username email');
+// Static method to get rate history for a branch
+exchangeRateSchema.statics.getRateHistory = function(limit = 50, branchId) {
+  return this.find(branchScope(branchId)).sort({ effectiveFrom: -1 }).limit(limit).populate('createdBy', 'username email');
 };
 
-// Static method to get the rate that was active on a given date
-exchangeRateSchema.statics.getRateForDate = function(date) {
-  return this.findOne({ effectiveFrom: { $lte: new Date(date) } }).sort({ effectiveFrom: -1 });
+// Static method to get the rate that was active on a given date, for a branch
+exchangeRateSchema.statics.getRateForDate = function(date, branchId) {
+  return this.findOne({ $and: [{ effectiveFrom: { $lte: new Date(date) } }, branchScope(branchId)] }).sort({ effectiveFrom: -1 });
 };
 
 // Instance method to deactivate this rate

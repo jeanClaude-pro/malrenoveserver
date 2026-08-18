@@ -7,7 +7,6 @@ const authMiddleware = require("../middleware/auth");
 const {
   BRANCHES,
   scopedFilter,
-  getBranchStock,
   adjustBranchStock,
 } = require("../utils/branchContext");
 
@@ -141,12 +140,14 @@ router.get("/ledger/:productId", authMiddleware, async (req, res) => {
       return res.status(periodError.status || 400).json({ error: periodError.message });
     }
 
-    const product = await Product.findById(productId).lean();
+    const product = await Product.findOne(
+      scopedFilter({ _id: productId }, req.branchId)
+    ).lean();
     if (!product) {
       return res.status(404).json({ error: "Article non trouvé" });
     }
 
-    const currentStock = getBranchStock(product, req.branchId);
+    const currentStock = product.stock;
 
     // Every movement from the period start onward (no upper bound) — needed to walk
     // both the starting-of-period balance and the ending-of-period balance back from
@@ -323,7 +324,9 @@ router.post("/", authMiddleware, async (req, res) => {
       return res.status(400).json({ error: "Le nom du client est requis pour un prêt" });
     }
 
-    const product = await Product.findById(productId).lean();
+    const product = await Product.findOne(
+      scopedFilter({ _id: productId }, req.branchId)
+    ).lean();
     if (!product) {
       return res.status(404).json({ error: "Article non trouvé" });
     }
@@ -331,7 +334,7 @@ router.post("/", authMiddleware, async (req, res) => {
       return res.status(400).json({ error: "Impossible de créer un mouvement pour un article inactif" });
     }
 
-    const previousStock = getBranchStock(product, req.branchId);
+    const previousStock = product.stock;
     // For loan and bonus_manual and adjustment_out, deduct from stock
     const decreasesStock = ["loan", "bonus_manual", "adjustment_out"].includes(type);
     // adjustment_in increases stock

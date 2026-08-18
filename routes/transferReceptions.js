@@ -7,7 +7,7 @@ const Transfer = require("../models/Transfer");
 const Product = require("../models/Product");
 const StockMovement = require("../models/StockMovement");
 const authMiddleware = require("../middleware/auth");
-const { scopedFilter, getBranchStock, adjustBranchStock } = require("../utils/branchContext");
+const { scopedFilter, adjustBranchStock } = require("../utils/branchContext");
 
 function buildTimeframeFilter(query) {
   const { from, to, date, year, month } = query;
@@ -176,7 +176,9 @@ router.post("/", authMiddleware, async (req, res) => {
         return res.status(400).json({ error: "Please indicate where this delivery came from" });
       }
 
-      const directProduct = await Product.findById(productId).lean();
+      const directProduct = await Product.findOne(
+        scopedFilter({ _id: productId }, req.branchId)
+      ).lean();
       if (!directProduct) return res.status(404).json({ error: "Product not found" });
 
       effectiveProductId = productId;
@@ -200,10 +202,12 @@ router.post("/", authMiddleware, async (req, res) => {
       return res.status(400).json({ error: "Received quantity must be greater than zero" });
     }
 
-    const product = await Product.findById(effectiveProductId).lean();
+    const product = await Product.findOne(
+      scopedFilter({ _id: effectiveProductId }, req.branchId)
+    ).lean();
     if (!product) return res.status(404).json({ error: "Product not found" });
 
-    const previousStock = getBranchStock(product, req.branchId);
+    const previousStock = product.stock;
     const newStock = previousStock + totalPieces;
     const receivedByName = receivedBy.trim();
 
@@ -327,7 +331,9 @@ router.put("/:id", authMiddleware, async (req, res) => {
       return res.status(400).json({ error: "Reason for edit is required" });
     }
 
-    const product = await Product.findById(original.product.productId).lean();
+    const product = await Product.findOne(
+      scopedFilter({ _id: original.product.productId }, req.branchId)
+    ).lean();
     if (!product) return res.status(404).json({ error: "Product not found" });
 
     const piecesPerCarton = Math.max(
@@ -356,7 +362,7 @@ router.put("/:id", authMiddleware, async (req, res) => {
 
     const originalPieces = original.product.totalPieces;
     const netAdjustment = newTotalPieces - originalPieces;
-    const currentStock = getBranchStock(product, req.branchId);
+    const currentStock = product.stock;
 
     // Ensure reversing original + applying new won't make stock negative
     if (currentStock - originalPieces + newTotalPieces < 0) {
@@ -492,8 +498,10 @@ router.patch("/:id/void", authMiddleware, async (req, res) => {
 
     const { reason } = req.body;
 
-    const product = await Product.findById(reception.product.productId).lean();
-    const currentStock = getBranchStock(product, req.branchId);
+    const product = await Product.findOne(
+      scopedFilter({ _id: reception.product.productId }, req.branchId)
+    ).lean();
+    const currentStock = product?.stock || 0;
     if (product && currentStock < reception.product.totalPieces) {
       return res.status(400).json({
         error: `Cannot void: current stock (${currentStock}) is less than received quantity (${reception.product.totalPieces}). Inventory would go negative.`,
@@ -603,8 +611,10 @@ router.delete("/:id", authMiddleware, async (req, res) => {
       session.startTransaction();
 
       if (reception.status === "active") {
-        const product = await Product.findById(reception.product.productId).lean();
-        const currentStock = getBranchStock(product, req.branchId);
+        const product = await Product.findOne(
+          scopedFilter({ _id: reception.product.productId }, req.branchId)
+        ).lean();
+        const currentStock = product?.stock || 0;
         if (product && currentStock < reception.product.totalPieces) {
           await session.abortTransaction();
           await session.endSession();

@@ -12,7 +12,6 @@ const authMiddleware = require("../middleware/auth");
 const {
   branchScope,
   scopedFilter,
-  getBranchStock,
   adjustBranchStock,
 } = require("../utils/branchContext");
 
@@ -804,7 +803,9 @@ router.post("/", authMiddleware, async (req, res) => {
         });
       }
 
-      const product = await Product.findById(productId).lean();
+      const product = await Product.findOne(
+        scopedFilter({ _id: productId }, req.branchId)
+      ).lean();
       if (!product)
         return res
           .status(400)
@@ -842,7 +843,7 @@ router.post("/", authMiddleware, async (req, res) => {
         });
       }
 
-      const availableStock = getBranchStock(product, req.branchId);
+      const availableStock = product.stock;
       if (availableStock < quantity) {
         return res.status(400).json({
           error: `Insufficient stock for ${
@@ -881,7 +882,7 @@ router.post("/", authMiddleware, async (req, res) => {
     const saleNumber = `SN-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
 
     // Capture the active exchange rate at the moment of sale (frozen for historical accuracy)
-    const rateRecord = await ExchangeRate.getCurrentRate();
+    const rateRecord = await ExchangeRate.getCurrentRate(req.branchId);
     const capturedRate = rateRecord ? rateRecord.rate : null;
 
     // Create/update customer only when phone is provided
@@ -1304,7 +1305,9 @@ router.put("/:id", authMiddleware, async (req, res) => {
         });
       }
 
-      const product = await Product.findById(productId).lean();
+      const product = await Product.findOne(
+        scopedFilter({ _id: productId }, req.branchId)
+      ).lean();
       if (!product) {
         return res.status(400).json({ error: `Product not found: ${productId}` });
       }
@@ -1420,8 +1423,10 @@ router.put("/:id", authMiddleware, async (req, res) => {
 
       const adjustmentMovements = [];
       for (const adjustment of stockAdjustments) {
-        const productBefore = await Product.findById(adjustment.productId).session(session).lean();
-        const previousStock = getBranchStock(productBefore, req.branchId);
+        const productBefore = await Product.findOne(
+          scopedFilter({ _id: adjustment.productId }, req.branchId)
+        ).session(session).lean();
+        const previousStock = productBefore?.stock || 0;
         const updatedProduct = await adjustBranchStock({
           productId: adjustment.productId,
           branchId: req.branchId,
@@ -1856,8 +1861,10 @@ router.patch("/:id/void", authMiddleware, async (req, res) => {
       if ((sale.type === "sale" || sale.type === "reservation") && sale.items && sale.items.length > 0) {
         const reversalMovements = [];
         for (const item of sale.items) {
-          const productBefore = await Product.findById(item.productId).session(session).lean();
-          const previousStock = getBranchStock(productBefore, req.branchId);
+          const productBefore = await Product.findOne(
+            scopedFilter({ _id: item.productId }, req.branchId)
+          ).session(session).lean();
+          const previousStock = productBefore?.stock || 0;
           const updatedProduct = await adjustBranchStock({
             productId: item.productId,
             branchId: req.branchId,
@@ -1952,8 +1959,10 @@ router.delete("/:id", authMiddleware, async (req, res) => {
           sale.status !== "voided") {
         const reversalMovements = [];
         for (const item of sale.items) {
-          const productBefore = await Product.findById(item.productId).session(session).lean();
-          const previousStock = getBranchStock(productBefore, req.branchId);
+          const productBefore = await Product.findOne(
+            scopedFilter({ _id: item.productId }, req.branchId)
+          ).session(session).lean();
+          const previousStock = productBefore?.stock || 0;
           const updatedProduct = await adjustBranchStock({
             productId: item.productId,
             branchId: req.branchId,

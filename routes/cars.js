@@ -8,7 +8,6 @@ const StockMovement = require("../models/StockMovement");
 const authMiddleware = require("../middleware/auth");
 const {
   scopedFilter,
-  getBranchStock,
   adjustBranchStock,
 } = require("../utils/branchContext");
 
@@ -77,7 +76,7 @@ function totalTripValue(trip) {
   return getTripProducts(trip).reduce((sum, item) => sum + item.value, 0);
 }
 
-async function buildCargoProducts(products, cargo, session, requireActive = true) {
+async function buildCargoProducts(products, cargo, session, requireActive = true, branchId) {
   const requested = Array.isArray(products) ? products : cargo ? [cargo] : [];
   if (requested.length === 0) {
     throw httpError(400, "Veuillez sélectionner au moins un produit pour le chargement");
@@ -106,7 +105,9 @@ async function buildCargoProducts(products, cargo, session, requireActive = true
     };
   });
 
-  let query = Product.find({ _id: { $in: normalized.map((item) => item.productId) } }).lean();
+  let query = Product.find(
+    scopedFilter({ _id: { $in: normalized.map((item) => item.productId) } }, branchId)
+  ).lean();
   if (session) query = query.session(session);
   const databaseProducts = await query;
   const byId = new Map(databaseProducts.map((product) => [String(product._id), product]));
@@ -173,9 +174,11 @@ async function applyInventoryDeltas(deltas, trip, req, session, reason) {
         session,
       });
       if (!product) {
-        const current = await Product.findById(deltaItem.productId).session(session).lean();
+        const current = await Product.findOne(
+          scopedFilter({ _id: deltaItem.productId }, branchId)
+        ).session(session).lean();
         if (!current) throw httpError(409, `Le produit "${deltaItem.productName}" n'existe plus; le stock ne peut pas être corrigé`);
-        throw httpError(409, `Stock insuffisant pour corriger "${current.name}". Disponible: ${getBranchStock(current, branchId)}, requis: ${Math.abs(deltaItem.delta)}`);
+        throw httpError(409, `Stock insuffisant pour corriger "${current.name}". Disponible: ${current.stock}, requis: ${Math.abs(deltaItem.delta)}`);
       }
     } else {
       product = await adjustBranchStock({ productId: deltaItem.productId, branchId, delta: deltaItem.delta, session });
@@ -194,8 +197,8 @@ async function applyInventoryDeltas(deltas, trip, req, session, reason) {
       recordedByUserId: req.user.userId,
       recordedByRole: req.user.role,
       branchId,
-      previousStock: getBranchStock(product, branchId) - deltaItem.delta,
-      newStock: getBranchStock(product, branchId),
+      previousStock: product.stock - deltaItem.delta,
+      newStock: product.stock,
     });
   }
   if (movements.length > 0) await StockMovement.create(movements, { session });
@@ -432,7 +435,7 @@ router.post("/", authMiddleware, async (req, res) => {
       return res.status(400).json({ error: "Departure time is required" });
     }
 
-    const cargoProducts = await buildCargoProducts(products, cargo, null, true);
+    const cargoProducts = await buildCargoProducts(products, cargo, null, true, req.branchId);
     const firstProduct = cargoProducts[0];
 
     // Create trip
@@ -616,7 +619,9 @@ router.patch("/:id/confirm-arrival", authMiddleware, async (req, res) => {
       }
 
       const productIds = plannedProducts.map((item) => item.productId);
-      const inventoryProducts = await Product.find({ _id: { $in: productIds } }).session(session);
+      const inventoryProducts = await Product.find(
+        scopedFilter({ _id: { $in: productIds } }, req.branchId)
+      ).session(session);
       const inventoryById = new Map(inventoryProducts.map((product) => [String(product._id), product]));
       if (inventoryProducts.length !== productIds.length) {
         throw httpError(409, "Un produit du trajet n'existe plus; l'arrivée ne peut pas être synchronisée avec le stock");
@@ -629,7 +634,7 @@ router.patch("/:id/confirm-arrival", authMiddleware, async (req, res) => {
       const totalReceived = inventoryItems.reduce((sum, item) => sum + item.quantity, 0);
       const positiveItems = inventoryItems.filter((item) => item.quantity > 0);
 
-      const previousStocks = new Map(inventoryProducts.map((product) => [String(product._id), getBranchStock(product, req.branchId)]));
+      const previousStocks = new Map(inventoryProducts.map((product) => [String(product._id), product.stock]));
       for (const item of positiveItems) {
         await adjustBranchStock({ productId: item.productId, branchId: req.branchId, delta: item.quantity, session });
       }
@@ -834,7 +839,7 @@ router.put("/:id", authMiddleware, async (req, res) => {
 
       if (Array.isArray(products) || cargo) {
         const oldProducts = getTripProducts(trip);
-        const cargoProducts = await buildCargoProducts(products, cargo, session, false);
+        const cargoProducts = await buildCargoProducts(products, cargo, session, false, req.branchId);
         const inventoryShape = (items) => items.map((item) => ({
           productId: String(item.productId),
           totalPieces: Number(item.totalPieces),

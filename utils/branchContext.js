@@ -33,69 +33,16 @@ function scopedFilter(filter, branchId, field = "branchId") {
   return { $and: [base, branchScope(branchId, field)] };
 }
 
-function stockPath(branchId) {
-  return `branchStock.${normalizeBranchId(branchId)}`;
-}
-
-function getBranchStock(product, branchId) {
-  if (!product) return 0;
-  const id = normalizeBranchId(branchId);
-  const stocks = product.branchStock;
-  const stored = stocks instanceof Map ? stocks.get(id) : stocks?.[id];
-  if (Number.isFinite(Number(stored))) return Number(stored);
-  return id === DEFAULT_BRANCH_ID ? Number(product.stock || 0) : 0;
-}
-
-function productForBranch(product, branchId) {
-  if (!product) return product;
-  const value = typeof product.toObject === "function" ? product.toObject() : { ...product };
-  value.stock = getBranchStock(value, branchId);
-  value.branchId = normalizeBranchId(branchId);
-  delete value.branchStock;
-  return value;
-}
-
-async function ensureBranchStock(productId, branchId, session) {
-  const id = normalizeBranchId(branchId);
-  const path = stockPath(id);
-  let query = Product.findById(productId).select(`stock ${path}`).lean();
-  if (session) query = query.session(session);
-  const product = await query;
-  if (!product) return null;
-  const current = getBranchStock(product, id);
-  let update = Product.updateOne(
-    { _id: productId, [path]: { $exists: false } },
-    { $set: { [path]: current } }
-  );
-  if (session) update = update.session(session);
-  await update;
-  return current;
-}
-
+// Atomically adjusts a product's stock, scoped to the branch it belongs to.
+// `requireAvailable` guards a negative delta with a $gte check so concurrent
+// requests can never drive stock below zero.
 async function adjustBranchStock({ productId, branchId, delta, session, requireAvailable = false }) {
   const id = normalizeBranchId(branchId);
-  const path = stockPath(id);
-  await ensureBranchStock(productId, id, session);
-
-  const filter = { _id: productId };
-  if (requireAvailable && delta < 0) filter[path] = { $gte: Math.abs(delta) };
-  const increments = { [path]: delta };
-  // Keep the original field synchronized for old clients and all legacy Butembo data.
-  if (id === DEFAULT_BRANCH_ID) increments.stock = delta;
-
-  return Product.findOneAndUpdate(
-    filter,
-    { $inc: increments },
-    { new: true, session }
-  );
-}
-
-async function setBranchStock({ productId, branchId, value, session, extraUpdates = {} }) {
-  const id = normalizeBranchId(branchId);
-  const path = stockPath(id);
-  const set = { ...extraUpdates, [path]: Math.max(0, Number(value) || 0) };
-  if (id === DEFAULT_BRANCH_ID) set.stock = set[path];
-  return Product.findByIdAndUpdate(productId, { $set: set }, { new: true, session, runValidators: true });
+  const filter = { _id: productId, branchId: id };
+  if (requireAvailable && delta < 0) filter.stock = { $gte: Math.abs(delta) };
+  let query = Product.findOneAndUpdate(filter, { $inc: { stock: delta } }, { new: true });
+  if (session) query = query.session(session);
+  return query;
 }
 
 module.exports = {
@@ -105,10 +52,5 @@ module.exports = {
   isSuperAdmin,
   branchScope,
   scopedFilter,
-  stockPath,
-  getBranchStock,
-  productForBranch,
-  ensureBranchStock,
   adjustBranchStock,
-  setBranchStock,
 };
