@@ -403,7 +403,7 @@ router.post("/", authMiddleware, async (req, res) => {
       category: category.trim(),
       description: description ? description.trim() : "",
       receivedFrom: receivedFrom || {},
-      createdBy: req.user.userId
+      createdBy: req.user.id
     };
 
     const entry = new Entry(entryData);
@@ -565,10 +565,10 @@ router.put("/:id", authMiddleware, async (req, res) => {
         category: category.trim(),
         description: description ? description.trim() : "",
         receivedFrom: receivedFrom || {},
-        updatedBy: req.user.userId,
+        updatedBy: req.user.id,
         $push: {
           editHistory: {
-            editedBy: req.user.userId,
+            editedBy: req.user.id,
             editedAt: new Date(),
             changes: Object.fromEntries(changes),
             reason: reason.trim()
@@ -622,7 +622,7 @@ router.delete("/:id", authMiddleware, async (req, res) => {
       scopedFilter({ _id: req.params.id }, req.branchId),
       {
         status: "deleted",
-        deletedBy: req.user.userId,
+        deletedBy: req.user.id,
         deletedAt: new Date()
       },
       { new: true }
@@ -669,7 +669,7 @@ router.patch("/:id/restore", authMiddleware, async (req, res) => {
         status: "active",
         deletedBy: null,
         deletedAt: null,
-        updatedBy: req.user.userId
+        updatedBy: req.user.id
       },
       { new: true }
     );
@@ -1050,7 +1050,7 @@ router.get("/user/me", authMiddleware, async (req, res) => {
     }
 
     // Add user filter
-    timeframeFilter.createdBy = req.user.userId;
+    timeframeFilter.createdBy = req.user.id;
     timeframeFilter.status = "active";
 
     const entries = await Entry.find(scopedFilter(timeframeFilter, req.branchId))
@@ -1062,7 +1062,7 @@ router.get("/user/me", authMiddleware, async (req, res) => {
 
     res.json({
       success: true,
-      userId: req.user.userId,
+      userId: req.user.id,
       timeframe: getTimeframeDescription(req.query),
       summary: {
         count: entries.length,
@@ -1086,7 +1086,7 @@ router.get("/permissions/me", authMiddleware, async (req, res) => {
       canDelete: req.user.isSuperAdmin,
       canRestore: req.user.isSuperAdmin,
       role: req.user.role,
-      userId: req.user.userId,
+      userId: req.user.id,
       userName: req.user.username || req.user.email || "User"
     };
 

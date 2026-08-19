@@ -237,7 +237,7 @@ router.post("/", authMiddleware, async (req, res) => {
         previousStock,
         newStock,
         recordedBy: req.user.name || req.user.username,
-        recordedByUserId: req.user.userId || req.user._id,
+        recordedByUserId: req.user.id || req.user._id,
       });
 
       if (operationDate && req.user.isAdmin) {
@@ -257,7 +257,7 @@ router.post("/", authMiddleware, async (req, res) => {
             reference: reception.receptionId,
             notes: effectiveSourceLocation,
             recordedBy: req.user.name || req.user.username || "Unknown",
-            recordedByUserId: req.user.userId || req.user._id,
+            recordedByUserId: req.user.id || req.user._id,
             recordedByRole: req.user.role,
             branchId: req.branchId,
             previousStock,
@@ -272,10 +272,10 @@ router.post("/", authMiddleware, async (req, res) => {
         transfer.status = "delivered";
         transfer.deliveredAt = reception.createdAt || new Date();
         transfer.deliveryConfirmedBy = receivedByName;
-        transfer.lastModifiedBy = req.user.userId;
+        transfer.lastModifiedBy = req.user.id;
         transfer.lastModifiedByName = req.user.name || req.user.username || "Unknown";
         transfer.editHistory.push({
-          modifiedBy: req.user.userId,
+          modifiedBy: req.user.id,
           modifiedByName: req.user.name || req.user.username || "Unknown",
           modifiedAt: new Date(),
           changes: { status: { from: previousTransferStatus, to: "delivered" } },

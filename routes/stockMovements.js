@@ -362,8 +362,8 @@ router.post("/", authMiddleware, async (req, res) => {
       loanCustomerPhone: loanCustomerPhone?.trim() || "",
       reference: reference?.trim() || "",
       notes: notes?.trim() || "",
-      recordedBy: req.user.username || req.user.userId,
-      recordedByUserId: req.user.userId,
+      recordedBy: req.user.username || req.user.id,
+      recordedByUserId: req.user.id,
       recordedByRole: req.user.role,
       branchId: req.branchId,
       previousStock,
@@ -410,7 +410,7 @@ router.patch("/:id/mark-loan-paid", authMiddleware, async (req, res) => {
       {
         loanPaid: true,
         loanPaidAt: new Date(),
-        loanPaidBy: req.user.username || req.user.userId,
+        loanPaidBy: req.user.username || req.user.id,
       },
       { new: true }
     );

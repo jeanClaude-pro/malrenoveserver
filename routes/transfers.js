@@ -239,7 +239,7 @@ router.post("/", authMiddleware, async (req, res) => {
       },
       notes: notes?.trim() || "",
       status: "pending",
-      createdBy: req.user.userId,
+      createdBy: req.user.id,
       createdByName: req.user.name || req.user.username || "Unknown",
     });
     if (customCreatedAt) transfer.createdAt = customCreatedAt;
@@ -308,11 +308,11 @@ router.patch("/:id/status", authMiddleware, async (req, res) => {
     // never touch Product.stock. Only a confirmed reception in
     // transferReceptions.js adds to inventory.
     transfer.status = status;
-    transfer.lastModifiedBy = req.user.userId;
+    transfer.lastModifiedBy = req.user.id;
     transfer.lastModifiedByName = modifiedByName;
 
     transfer.editHistory.push({
-      modifiedBy: req.user.userId,
+      modifiedBy: req.user.id,
       modifiedByName,
       modifiedAt: new Date(),
       changes: { status: { from: oldStatus, to: status } },
@@ -404,10 +404,10 @@ router.patch("/:id/confirm-delivery", authMiddleware, async (req, res) => {
       transfer.deliveredAt = deliveredAt;
       transfer.deliveryConfirmedBy = confirmedBy;
       transfer.inventoryDeducted = true;
-      transfer.lastModifiedBy = req.user.userId;
+      transfer.lastModifiedBy = req.user.id;
       transfer.lastModifiedByName = confirmedBy;
       transfer.editHistory.push({
-        modifiedBy: req.user.userId,
+        modifiedBy: req.user.id,
         modifiedByName: confirmedBy,
         modifiedAt: deliveredAt,
         changes: { status: { from: previousStatus, to: "delivered" }, inventory: { deducted: quantity } },
@@ -424,7 +424,7 @@ router.patch("/:id/confirm-delivery", authMiddleware, async (req, res) => {
         reference: transfer.transferId,
         notes: `Transfert livré à ${transfer.destinationAgency}${reason ? ` — ${reason}` : ""}`,
         recordedBy: confirmedBy,
-        recordedByUserId: req.user.userId,
+        recordedByUserId: req.user.id,
         recordedByRole: req.user.role,
         branchId: req.branchId,
         previousStock,
@@ -555,12 +555,12 @@ router.put("/:id", authMiddleware, async (req, res) => {
     }
 
     const modifiedByName = req.user.name || req.user.username || "Unknown";
-    transfer.lastModifiedBy = req.user.userId;
+    transfer.lastModifiedBy = req.user.id;
     transfer.lastModifiedByName = modifiedByName;
 
     if (changes.size > 0) {
       transfer.editHistory.push({
-        modifiedBy: req.user.userId,
+        modifiedBy: req.user.id,
         modifiedByName,
         modifiedAt: new Date(),
         changes: Object.fromEntries(changes),

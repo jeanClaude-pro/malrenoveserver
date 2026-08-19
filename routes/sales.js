@@ -992,7 +992,7 @@ router.post("/", authMiddleware, async (req, res) => {
             reference: savedSale.saleId,
             notes: customer?.name ? `Vente à ${customer.name}` : "Vente",
             recordedBy: req.user.name || req.user.username || "Unknown",
-            recordedByUserId: req.user.userId,
+            recordedByUserId: req.user.id,
             recordedByRole: req.user.role,
             branchId: req.branchId,
             previousStock: it.previousStock,
@@ -1012,12 +1012,15 @@ router.post("/", authMiddleware, async (req, res) => {
 
     return res.status(201).json(savedSale);
   } catch (error) {
-    console.error("Error creating sale/expense:", error);
+    console.error("SALE ERROR:", error);
     if (error.name === "ValidationError") {
       const errors = Object.values(error.errors).map((e) => e.message);
       return res.status(400).json({ error: errors.join(", ") });
     }
-    return res.status(500).json({ error: "Failed to create sale/expense" });
+    return res.status(500).json({
+      error: error.message || "Failed to create sale/expense",
+      ...(process.env.NODE_ENV === "development" && { stack: error.stack }),
+    });
   }
 });
 
@@ -1271,11 +1274,11 @@ router.put("/:id", authMiddleware, async (req, res) => {
           total: expenseAmount,
           paymentMethod: normalizedPM,
           notes: notes || originalSale.notes,
-          editedBy: req.user.userId,
+          editedBy: req.user.id,
           editedAt: new Date(),
           $push: {
             editHistory: {
-              editedBy: req.user.userId,
+              editedBy: req.user.id,
               editedAt: new Date(),
               changes: Object.fromEntries(changes),
               reason: reason || "Expense correction"
@@ -1448,7 +1451,7 @@ router.put("/:id", authMiddleware, async (req, res) => {
           reference: originalSale.saleId,
           notes: reason || "Correction de vente",
           recordedBy: req.user.name || req.user.username || "Unknown",
-          recordedByUserId: req.user.userId,
+          recordedByUserId: req.user.id,
           recordedByRole: req.user.role,
           branchId: req.branchId,
           previousStock,
@@ -1471,11 +1474,11 @@ router.put("/:id", authMiddleware, async (req, res) => {
           reservationDate: reservationDate || originalSale.reservationDate,
           reservationTime: reservationTime || originalSale.reservationTime,
           notes: notes || originalSale.notes,
-          editedBy: req.user.userId,
+          editedBy: req.user.id,
           editedAt: new Date(),
           $push: {
             editHistory: {
-              editedBy: req.user.userId,
+              editedBy: req.user.id,
               editedAt: new Date(),
               changes: Object.fromEntries(changes),
               reason: reason || "Sale correction"
@@ -1532,7 +1535,7 @@ router.patch("/:id/complete", authMiddleware, async (req, res) => {
       {
         status: "completed",
         completedAt: new Date(),
-        completedBy: req.user.username || req.user.userId,
+        completedBy: req.user.username || req.user.id,
       },
       { new: true }
     );
@@ -1631,7 +1634,7 @@ router.patch("/:id/credit-payment", authMiddleware, async (req, res) => {
             amount: paymentAmount,
             date: new Date(),
             method: normalizedMethod,
-            recordedBy: req.user.username || req.user.userId,
+            recordedBy: req.user.username || req.user.id,
             notes: notes || "",
             status: "pending",
           },
@@ -1726,7 +1729,7 @@ router.patch(
 
       const paymentAmount = Number(payment.amount);
       const confirmedAt = new Date();
-      const confirmedBy = req.user.username || req.user.userId;
+      const confirmedBy = req.user.username || req.user.id;
       const updatedSale = await Sale.findOneAndUpdate(
         {
           ...scopedFilter({ _id: id }, req.branchId),
@@ -1881,7 +1884,7 @@ router.patch("/:id/void", authMiddleware, async (req, res) => {
               reference: sale.saleId,
               notes: reason || "Vente annulée",
               recordedBy: req.user.name || req.user.username || "Unknown",
-              recordedByUserId: req.user.userId,
+              recordedByUserId: req.user.id,
               recordedByRole: req.user.role,
               branchId: req.branchId,
               previousStock,
@@ -1898,11 +1901,11 @@ router.patch("/:id/void", authMiddleware, async (req, res) => {
         scopedFilter({ _id: id }, req.branchId),
         {
           status: "voided",
-          voidedBy: req.user.userId,
+          voidedBy: req.user.id,
           voidedAt: new Date(),
           $push: {
             editHistory: {
-              editedBy: req.user.userId,
+              editedBy: req.user.id,
               editedAt: new Date(),
               changes: { status: { from: sale.status, to: "voided" } },
               reason: reason || "Sale voided"
@@ -1979,7 +1982,7 @@ router.delete("/:id", authMiddleware, async (req, res) => {
               reference: sale.saleId,
               notes: "Vente supprimée",
               recordedBy: req.user.name || req.user.username || "Unknown",
-              recordedByUserId: req.user.userId,
+              recordedByUserId: req.user.id,
               recordedByRole: req.user.role,
               branchId: req.branchId,
               previousStock,

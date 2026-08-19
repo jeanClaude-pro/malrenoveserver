@@ -68,7 +68,6 @@ async function authMiddleware(req, res, next) {
     req.user = {
       ...user,
       id: userId,
-      userId,
       name: user.username,
       branchId: assignedBranchId,
       activeBranchId: req.branchId,

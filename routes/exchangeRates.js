@@ -81,7 +81,7 @@ router.post("/", authMiddleware, async (req, res) => {
       branchId: req.branchId,
       rate: parseFloat(rate),
       effectiveFrom: effectiveFrom ? new Date(effectiveFrom) : new Date(),
-      createdBy: req.user.userId,
+      createdBy: req.user.id,
       notes: notes || ""
     });
 

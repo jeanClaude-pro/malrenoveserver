@@ -194,7 +194,7 @@ async function applyInventoryDeltas(deltas, trip, req, session, reason) {
       reference: trip.tripId,
       notes: reason,
       recordedBy: req.user.name || req.user.username || "Unknown",
-      recordedByUserId: req.user.userId,
+      recordedByUserId: req.user.id,
       recordedByRole: req.user.role,
       branchId,
       previousStock: product.stock - deltaItem.delta,
@@ -471,7 +471,7 @@ router.post("/", authMiddleware, async (req, res) => {
       otherCosts: otherCosts || 0,
       notes: notes || "",
       status: "en_route",
-      createdBy: req.user.userId,
+      createdBy: req.user.id,
       createdByName: req.user.name || req.user.username || "Unknown",
     });
     
@@ -555,11 +555,11 @@ router.patch("/:id/confirm-arrival", authMiddleware, async (req, res) => {
           totalReceivedPieces: boxes * pieces,
           notes: (notes || "").trim(),
         };
-        trip.lastModifiedBy = req.user.userId;
+        trip.lastModifiedBy = req.user.id;
         trip.lastModifiedByName = confirmedBy;
         trip.lastUpdate = now;
         trip.editHistory.push({
-          modifiedBy: req.user.userId,
+          modifiedBy: req.user.id,
           modifiedByName: confirmedBy,
           modifiedAt: now,
           changes: { status: { from: previousStatus, to: "arrived" } },
@@ -648,7 +648,7 @@ router.patch("/:id/confirm-arrival", authMiddleware, async (req, res) => {
           reference: trip.tripId,
           notes: (notes || "").trim(),
           recordedBy: confirmedBy,
-          recordedByUserId: req.user.userId,
+          recordedByUserId: req.user.id,
           recordedByRole: req.user.role,
           branchId: req.branchId,
           previousStock: previousStocks.get(String(item.productId)) || 0,
@@ -681,11 +681,11 @@ router.patch("/:id/confirm-arrival", authMiddleware, async (req, res) => {
         quantity: item.quantity,
         piecesPerCarton: item.piecesPerCarton,
       }));
-      trip.lastModifiedBy = req.user.userId;
+      trip.lastModifiedBy = req.user.id;
       trip.lastModifiedByName = confirmedBy;
       trip.lastUpdate = now;
       trip.editHistory.push({
-        modifiedBy: req.user.userId,
+        modifiedBy: req.user.id,
         modifiedByName: confirmedBy,
         modifiedAt: now,
         changes: { status: { from: previousStatus, to: "arrived" }, inventoryItems: trip.inventoryItems },
@@ -753,12 +753,12 @@ router.patch("/:id/status", authMiddleware, async (req, res) => {
     trip.currentLocation = currentLocation || trip.currentLocation;
     trip.actualArrivalTime = actualArrivalTime;
     trip.lastUpdate = new Date();
-    trip.lastModifiedBy = req.user.userId;
+    trip.lastModifiedBy = req.user.id;
     trip.lastModifiedByName = req.user.name || req.user.username || "Unknown";
     
     // Add to edit history
     trip.editHistory.push({
-      modifiedBy: req.user.userId,
+      modifiedBy: req.user.id,
       modifiedByName: req.user.name || req.user.username || "Unknown",
       modifiedAt: new Date(),
       changes: Object.fromEntries(changes),
@@ -929,12 +929,12 @@ router.put("/:id", authMiddleware, async (req, res) => {
         trip.notes = notes;
       }
 
-      trip.lastModifiedBy = req.user.userId;
+      trip.lastModifiedBy = req.user.id;
       trip.lastModifiedByName = req.user.name || req.user.username || "Unknown";
       trip.lastUpdate = new Date();
       if (changes.size > 0) {
         trip.editHistory.push({
-          modifiedBy: req.user.userId,
+          modifiedBy: req.user.id,
           modifiedByName: req.user.name || req.user.username || "Unknown",
           modifiedAt: new Date(),
           changes: Object.fromEntries(changes),
