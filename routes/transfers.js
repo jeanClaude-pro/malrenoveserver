@@ -429,7 +429,7 @@ router.patch("/:id/confirm-delivery", authMiddleware, async (req, res) => {
         branchId: req.branchId,
         previousStock,
         newStock: previousStock - quantity,
-      }], { session });
+      }], { session, ordered: true });
 
       deliveredTransfer = transfer;
       remainingStock = product.stock;

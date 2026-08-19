@@ -201,7 +201,7 @@ async function applyInventoryDeltas(deltas, trip, req, session, reason) {
       newStock: product.stock,
     });
   }
-  if (movements.length > 0) await StockMovement.create(movements, { session });
+  if (movements.length > 0) await StockMovement.create(movements, { session, ordered: true });
 }
 
 // Helper function to build timeframe filter
@@ -653,7 +653,7 @@ router.patch("/:id/confirm-arrival", authMiddleware, async (req, res) => {
           branchId: req.branchId,
           previousStock: previousStocks.get(String(item.productId)) || 0,
           newStock: (previousStocks.get(String(item.productId)) || 0) + item.quantity,
-        })), { session });
+        })), { session, ordered: true });
       }
 
       const previousStatus = trip.status;

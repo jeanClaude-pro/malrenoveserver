@@ -292,7 +292,7 @@ router.put("/:id", authMiddleware, isAdmin, async (req, res) => {
               newStock: previousStock + stockDelta,
             },
           ],
-          { session }
+          { session, ordered: true }
         );
       }
     });

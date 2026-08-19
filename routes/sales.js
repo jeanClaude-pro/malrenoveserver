@@ -998,7 +998,7 @@ router.post("/", authMiddleware, async (req, res) => {
             previousStock: it.previousStock,
             newStock: it.previousStock - it.quantity,
           })),
-          { session }
+          { session, ordered: true }
         );
       }
 
@@ -1459,7 +1459,7 @@ router.put("/:id", authMiddleware, async (req, res) => {
         });
       }
       if (adjustmentMovements.length > 0) {
-        await StockMovement.create(adjustmentMovements, { session });
+        await StockMovement.create(adjustmentMovements, { session, ordered: true });
       }
 
       updatedSale = await Sale.findOneAndUpdate(
@@ -1893,7 +1893,7 @@ router.patch("/:id/void", authMiddleware, async (req, res) => {
           }
         }
         if (reversalMovements.length > 0) {
-          await StockMovement.create(reversalMovements, { session });
+          await StockMovement.create(reversalMovements, { session, ordered: true });
         }
       }
 
@@ -1991,7 +1991,7 @@ router.delete("/:id", authMiddleware, async (req, res) => {
           }
         }
         if (reversalMovements.length > 0) {
-          await StockMovement.create(reversalMovements, { session });
+          await StockMovement.create(reversalMovements, { session, ordered: true });
         }
       }
 

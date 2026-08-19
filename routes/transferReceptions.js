@@ -264,7 +264,7 @@ router.post("/", authMiddleware, async (req, res) => {
             newStock,
           },
         ],
-        { session }
+        { session, ordered: true }
       );
 
       if (transfer) {
@@ -437,7 +437,7 @@ router.put("/:id", authMiddleware, async (req, res) => {
               newStock: currentStock + netAdjustment,
             },
           ],
-          { session }
+          { session, ordered: true }
         );
       }
 
@@ -533,7 +533,7 @@ router.patch("/:id/void", authMiddleware, async (req, res) => {
             newStock: currentStock - reception.product.totalPieces,
           },
         ],
-        { session }
+        { session, ordered: true }
       );
 
       voided = await TransferReception.findOneAndUpdate(
@@ -643,7 +643,7 @@ router.delete("/:id", authMiddleware, async (req, res) => {
               newStock: currentStock - reception.product.totalPieces,
             },
           ],
-          { session }
+          { session, ordered: true }
         );
 
         if (reception.transferId) {
