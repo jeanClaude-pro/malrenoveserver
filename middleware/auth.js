@@ -5,6 +5,7 @@ const {
   DEFAULT_BRANCH_ID,
   normalizeBranchId,
   isSuperAdmin,
+  canSwitchBranch,
 } = require("../utils/branchContext");
 
 async function authMiddleware(req, res, next) {
@@ -30,6 +31,10 @@ async function authMiddleware(req, res, next) {
 
     const userId = user._id.toString();
     const superAdmin = isSuperAdmin(user);
+    // Narrower than superAdmin: only this decides whether X-Branch-Id can move
+    // the request off the user's assigned branch. Every other authorization
+    // flag below (canValidate/isAdmin/isSuperAdmin) stays keyed to superAdmin.
+    const canSwitch = canSwitchBranch(user);
     const assignedBranchId = normalizeBranchId(user.branchId, DEFAULT_BRANCH_ID);
     const requestedHeader = req.header("X-Branch-Id");
     const requestedBranchId = requestedHeader
@@ -39,11 +44,11 @@ async function authMiddleware(req, res, next) {
     if (!requestedBranchId) {
       return res.status(400).json({ message: "Invalid branch" });
     }
-    if (!superAdmin && requestedHeader && requestedBranchId !== assignedBranchId) {
+    if (!canSwitch && requestedHeader && requestedBranchId !== assignedBranchId) {
       return res.status(403).json({ message: "Access denied for the requested branch" });
     }
 
-    req.branchId = superAdmin ? requestedBranchId : assignedBranchId;
+    req.branchId = canSwitch ? requestedBranchId : assignedBranchId;
     req.branch = BRANCHES.find((branch) => branch.id === req.branchId);
     req.user = {
       ...user,

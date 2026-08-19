@@ -6,7 +6,7 @@ const User = require("../models/User");
 const bcrypt = require("bcryptjs");
 const generateToken = require("../utils/generateToken");
 const authMiddleware = require("../middleware/auth");
-const { BRANCHES, normalizeBranchId } = require("../utils/branchContext");
+const { BRANCHES, normalizeBranchId, canSwitchBranch } = require("../utils/branchContext");
 
 // Helper: basic field guard
 function required(...fields) {
@@ -147,7 +147,7 @@ router.get("/branches", authMiddleware, (req, res) => {
     branches: BRANCHES,
     activeBranchId: req.branchId,
     assignedBranchId: req.user.branchId,
-    canSwitchBranch: req.user.isSuperAdmin,
+    canSwitchBranch: canSwitchBranch(req.user),
   });
 });
 

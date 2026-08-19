@@ -16,6 +16,11 @@ function isSuperAdmin(user) {
   return user?.role === "admin" || user?.role === "superadmin";
 }
 
+// Branch switching is narrower than isSuperAdmin: superadmin only, admin excluded.
+function canSwitchBranch(user) {
+  return user?.role === "superadmin";
+}
+
 function branchScope(branchId, field = "branchId") {
   const id = normalizeBranchId(branchId);
   if (id !== DEFAULT_BRANCH_ID) return { [field]: id };
@@ -54,6 +59,7 @@ module.exports = {
   DEFAULT_BRANCH_ID,
   normalizeBranchId,
   isSuperAdmin,
+  canSwitchBranch,
   branchScope,
   scopedFilter,
   adjustBranchStock,
