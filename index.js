@@ -55,7 +55,10 @@ app.use(cors({
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'Idempotency-Key', 'X-Branch-Id']
+  allowedHeaders: ['Content-Type', 'Authorization', 'Idempotency-Key', 'X-Branch-Id'],
+  // Lets the client pick up a silently-renewed JWT (see middleware/auth.js) —
+  // browsers hide custom response headers from JS unless explicitly exposed here.
+  exposedHeaders: ['X-New-Token'],
 }));
 
 // Force HTTPS in production (proxy-aware; Render terminates TLS upstream).

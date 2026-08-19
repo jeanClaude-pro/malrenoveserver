@@ -1,5 +1,6 @@
 const jwt = require("jsonwebtoken");
 const User = require("../models/User");
+const generateToken = require("../utils/generateToken");
 const {
   BRANCHES,
   DEFAULT_BRANCH_ID,
@@ -7,6 +8,13 @@ const {
   isSuperAdmin,
   canSwitchBranch,
 } = require("../utils/branchContext");
+
+// Tokens are minted with a 1-day lifetime (utils/generateToken.js). Rather than
+// forcing a hard logout mid-shift, any request made once less than this much of
+// that lifetime remains gets silently handed a fresh token (see X-New-Token
+// below). A user making at least one request every ~18h therefore never hits
+// the hard expiry; someone truly gone for a full day still gets logged out.
+const SLIDING_REFRESH_THRESHOLD_MS = 6 * 60 * 60 * 1000; // 6 hours
 
 async function authMiddleware(req, res, next) {
   const authHeader = req.header("Authorization");
@@ -18,6 +26,13 @@ async function authMiddleware(req, res, next) {
 
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
+
+    if (decoded.exp) {
+      const remainingMs = decoded.exp * 1000 - Date.now();
+      if (remainingMs > 0 && remainingMs < SLIDING_REFRESH_THRESHOLD_MS) {
+        res.set("X-New-Token", generateToken({ id: decoded.id }));
+      }
+    }
 
     // Use lean() so req.user is a plain JS object — avoids Mongoose document quirks
     const user = await User.findById(decoded.id).select("-password").lean();
@@ -65,7 +80,9 @@ async function authMiddleware(req, res, next) {
     next();
   } catch (err) {
     console.error("Auth error:", err.message);
-    res.status(401).json({ message: "Token is not valid" });
+    const message =
+      err.name === "TokenExpiredError" ? "Token expired" : "Token is not valid";
+    res.status(401).json({ message });
   }
 }
 
