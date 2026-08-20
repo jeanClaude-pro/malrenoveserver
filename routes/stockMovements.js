@@ -189,6 +189,14 @@ router.get("/ledger/:productId", authMiddleware, async (req, res) => {
     let running = startingStock;
     let added = 0;
     let removed = 0;
+    // Sales happen at POS-transaction frequency — dozens a day — so they're rolled
+    // up into one "total sold" / "total bonus" figure for the period instead of one
+    // itemized row per transaction. Everything else (manual adjustments, loans,
+    // transfers, standalone bonuses) is a deliberate one-off action with its own
+    // reason and stays itemized below.
+    let soldQtyPieces = 0;
+    let bonusQtyPieces = 0;
+    let soldTransactionsCount = 0;
     const actions = [];
     for (const movement of movements) {
       if (movement.createdAt > period.end) continue;
@@ -198,74 +206,44 @@ router.get("/ledger/:productId", authMiddleware, async (req, res) => {
       if (signed > 0) added += signed;
       else removed += -signed;
 
-      const ppc = movement.piecesPerCarton || 1;
-      // Sale movements recorded after the paidCartons/paidPieces fields were added
-      // carry the paid/bonus carton-piece split — render them as two ledger rows
-      // (Vente + Bonus) instead of one combined figure. Legacy sale rows (field
-      // absent, not just zero) fall through to the single-row default below.
-      const isSplitSale = movement.type === "sale" && movement.paidCartons != null;
-
-      if (isSplitSale) {
-        const paidQty = movement.paidCartons * ppc + movement.paidPieces;
-        const bonusQty = movement.bonusCartons * ppc + movement.bonusPieces;
-        const afterSale = previousStock - paidQty;
-
-        actions.push({
-          id: `${movement._id}-sale`,
-          date: movement.createdAt,
-          type: "sale",
-          label: MOVEMENT_LABELS.sale,
-          source: MOVEMENT_SOURCES.sale,
-          boxes: -movement.paidCartons,
-          pieces: -movement.paidPieces,
-          previousStock,
-          change: -paidQty,
-          newStock: afterSale,
-          performedBy: movement.recordedBy || "Inconnu",
-          performedByRole: movement.recordedByRole || "",
-          branchId: req.branchId,
-          reason: movement.notes || "",
-        });
-
-        if (bonusQty > 0) {
-          actions.push({
-            id: `${movement._id}-bonus`,
-            date: movement.createdAt,
-            type: "bonus_manual",
-            label: "Bonus",
-            source: MOVEMENT_SOURCES.sale,
-            boxes: -movement.bonusCartons,
-            pieces: -movement.bonusPieces,
-            previousStock: afterSale,
-            change: -bonusQty,
-            newStock: running,
-            performedBy: movement.recordedBy || "Inconnu",
-            performedByRole: movement.recordedByRole || "",
-            branchId: req.branchId,
-            reason: movement.notes || "",
-          });
+      if (movement.type === "sale") {
+        soldTransactionsCount += 1;
+        if (movement.paidCartons != null) {
+          const ppc = movement.piecesPerCarton || 1;
+          soldQtyPieces += movement.paidCartons * ppc + movement.paidPieces;
+          bonusQtyPieces += movement.bonusCartons * ppc + movement.bonusPieces;
+        } else {
+          // Legacy sale row predating the paid/bonus split — can't separate the
+          // two, so the whole quantity counts as sold.
+          soldQtyPieces += movement.quantity;
         }
-      } else {
-        const { boxes, pieces } = splitBoxes(movement.quantity, ppc);
-        actions.push({
-          id: String(movement._id),
-          date: movement.createdAt,
-          type: movement.type,
-          label: MOVEMENT_LABELS[movement.type] || movement.type,
-          source: MOVEMENT_SOURCES[movement.type] || movement.type,
-          boxes: signed >= 0 ? boxes : -boxes,
-          pieces: signed >= 0 ? pieces : -pieces,
-          previousStock,
-          change: signed,
-          newStock: running,
-          performedBy: movement.recordedBy || "Inconnu",
-          performedByRole: movement.recordedByRole || "",
-          branchId: req.branchId,
-          reason: movement.notes || "",
-        });
+        continue;
       }
+
+      const ppc = movement.piecesPerCarton || 1;
+      const { boxes, pieces } = splitBoxes(movement.quantity, ppc);
+      actions.push({
+        id: String(movement._id),
+        date: movement.createdAt,
+        type: movement.type,
+        label: MOVEMENT_LABELS[movement.type] || movement.type,
+        source: MOVEMENT_SOURCES[movement.type] || movement.type,
+        boxes: signed >= 0 ? boxes : -boxes,
+        pieces: signed >= 0 ? pieces : -pieces,
+        previousStock,
+        change: signed,
+        newStock: running,
+        performedBy: movement.recordedBy || "Inconnu",
+        performedByRole: movement.recordedByRole || "",
+        branchId: req.branchId,
+        reason: movement.notes || "",
+      });
     }
     actions.reverse(); // most recent first, matching every other history view in the app
+
+    const productPpc = product.piecesPerCarton || 1;
+    const sold = splitBoxes(soldQtyPieces, productPpc);
+    const bonus = splitBoxes(bonusQtyPieces, productPpc);
 
     res.json({
       success: true,
@@ -290,6 +268,11 @@ router.get("/ledger/:productId", authMiddleware, async (req, res) => {
         endingStock,
         currentStock,
         actionsCount: actions.length,
+        soldCartons: sold.boxes,
+        soldPieces: sold.pieces,
+        soldTransactionsCount,
+        bonusCartons: bonus.boxes,
+        bonusPieces: bonus.pieces,
       },
       actions,
     });
