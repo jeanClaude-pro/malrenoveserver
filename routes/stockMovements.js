@@ -70,6 +70,15 @@ function signedQuantity(movement) {
   return DECREASE_TYPES.has(movement.type) ? -movement.quantity : movement.quantity;
 }
 
+// Same floor/modulo split the front-end's splitStock() uses — kept here too so the
+// ledger endpoint can hand the UI/PDF ready-to-render boxes/pieces without the
+// client having to recompute it from a raw pieces total.
+function splitBoxes(quantity, piecesPerCarton) {
+  const ppc = Math.max(1, Math.floor(Number(piecesPerCarton || 1)));
+  const total = Math.max(0, Math.floor(Number(quantity || 0)));
+  return { boxes: Math.floor(total / ppc), pieces: total % ppc };
+}
+
 // Resolves { start, end } for the Fiche de Stock period selector: today / week / month / custom.
 function resolveLedgerPeriod(query) {
   const { range, from, to } = query;
@@ -128,6 +137,13 @@ function resolveLedgerPeriod(query) {
  */
 router.get("/ledger/:productId", authMiddleware, async (req, res) => {
   try {
+    // Advanced Fiche de Stock is superadmin-only — deliberately narrower than
+    // isSuperAdmin() (which also allows role "admin"), mirroring the existing
+    // canSwitchBranch precedent in utils/branchContext.js.
+    if (req.user.role !== "superadmin") {
+      return res.status(403).json({ error: "Accès réservé au Super Admin" });
+    }
+
     const { productId } = req.params;
     if (!mongoose.Types.ObjectId.isValid(productId)) {
       return res.status(400).json({ error: "productId invalide" });
@@ -181,21 +197,73 @@ router.get("/ledger/:productId", authMiddleware, async (req, res) => {
       running += signed;
       if (signed > 0) added += signed;
       else removed += -signed;
-      actions.push({
-        id: movement._id,
-        date: movement.createdAt,
-        type: movement.type,
-        label: MOVEMENT_LABELS[movement.type] || movement.type,
-        source: MOVEMENT_SOURCES[movement.type] || movement.type,
-        reference: movement.reference || "",
-        previousStock,
-        change: signed,
-        newStock: running,
-        performedBy: movement.recordedBy || "Inconnu",
-        performedByRole: movement.recordedByRole || "",
-        branchId: req.branchId,
-        reason: movement.notes || "",
-      });
+
+      const ppc = movement.piecesPerCarton || 1;
+      // Sale movements recorded after the paidCartons/paidPieces fields were added
+      // carry the paid/bonus carton-piece split — render them as two ledger rows
+      // (Vente + Bonus) instead of one combined figure. Legacy sale rows (field
+      // absent, not just zero) fall through to the single-row default below.
+      const isSplitSale = movement.type === "sale" && movement.paidCartons != null;
+
+      if (isSplitSale) {
+        const paidQty = movement.paidCartons * ppc + movement.paidPieces;
+        const bonusQty = movement.bonusCartons * ppc + movement.bonusPieces;
+        const afterSale = previousStock - paidQty;
+
+        actions.push({
+          id: `${movement._id}-sale`,
+          date: movement.createdAt,
+          type: "sale",
+          label: MOVEMENT_LABELS.sale,
+          source: MOVEMENT_SOURCES.sale,
+          boxes: -movement.paidCartons,
+          pieces: -movement.paidPieces,
+          previousStock,
+          change: -paidQty,
+          newStock: afterSale,
+          performedBy: movement.recordedBy || "Inconnu",
+          performedByRole: movement.recordedByRole || "",
+          branchId: req.branchId,
+          reason: movement.notes || "",
+        });
+
+        if (bonusQty > 0) {
+          actions.push({
+            id: `${movement._id}-bonus`,
+            date: movement.createdAt,
+            type: "bonus_manual",
+            label: "Bonus",
+            source: MOVEMENT_SOURCES.sale,
+            boxes: -movement.bonusCartons,
+            pieces: -movement.bonusPieces,
+            previousStock: afterSale,
+            change: -bonusQty,
+            newStock: running,
+            performedBy: movement.recordedBy || "Inconnu",
+            performedByRole: movement.recordedByRole || "",
+            branchId: req.branchId,
+            reason: movement.notes || "",
+          });
+        }
+      } else {
+        const { boxes, pieces } = splitBoxes(movement.quantity, ppc);
+        actions.push({
+          id: String(movement._id),
+          date: movement.createdAt,
+          type: movement.type,
+          label: MOVEMENT_LABELS[movement.type] || movement.type,
+          source: MOVEMENT_SOURCES[movement.type] || movement.type,
+          boxes: signed >= 0 ? boxes : -boxes,
+          pieces: signed >= 0 ? pieces : -pieces,
+          previousStock,
+          change: signed,
+          newStock: running,
+          performedBy: movement.recordedBy || "Inconnu",
+          performedByRole: movement.recordedByRole || "",
+          branchId: req.branchId,
+          reason: movement.notes || "",
+        });
+      }
     }
     actions.reverse(); // most recent first, matching every other history view in the app
 

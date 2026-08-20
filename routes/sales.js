@@ -705,14 +705,17 @@ router.post("/", authMiddleware, async (req, res) => {
 
     const normalizedPM = normalizePaymentMethod(paymentMethod);
 
-    // Only admins may pick a different day for the sale to be recorded under.
+    // Only superadmins may pick a different day for the sale to be recorded
+    // under. NOTE: req.user.isSuperAdmin (see utils/branchContext.js) is true
+    // for role "admin" too despite its name — plain "admin" must NOT get this
+    // power, so we check req.user.role directly here rather than that flag.
     // Mongoose's `timestamps: true` only auto-fills `createdAt` when it isn't
     // already set, so assigning it here makes the sale appear/be calculated
     // under that date everywhere createdAt is used for filtering (SalesHistory,
     // CompanyReport, etc.) — the time-of-day is kept as "now" so ordering within
     // the day stays chronological.
     let customCreatedAt = null;
-    if (saleDate && req.user?.isSuperAdmin) {
+    if (saleDate && req.user?.role === "superadmin") {
       const datePart = String(saleDate).slice(0, 10);
       const now = new Date();
       const timeOfDay = [
@@ -989,6 +992,10 @@ router.post("/", authMiddleware, async (req, res) => {
             type: "sale",
             quantity: it.quantity,
             piecesPerCarton: it.piecesPerCarton,
+            paidCartons: it.cartonQuantity,
+            paidPieces: it.looseQuantity,
+            bonusCartons: it.bonusCartons,
+            bonusPieces: it.bonusPieces,
             reference: savedSale.saleId,
             notes: customer?.name ? `Vente à ${customer.name}` : "Vente",
             recordedBy: req.user.name || req.user.username || "Unknown",

@@ -33,6 +33,14 @@ const stockMovementSchema = new mongoose.Schema(
       default: 1,
       min: 1,
     },
+    // Paid/bonus carton-piece breakdown — populated only for type "sale" so the
+    // Fiche de Stock ledger can render "Vente" and "Bonus" as two separate rows
+    // instead of one combined quantity. Legacy sale movements predating this
+    // field simply leave these at 0 and fall back to a single combined row.
+    paidCartons: { type: Number, default: 0, min: 0 },
+    paidPieces: { type: Number, default: 0, min: 0 },
+    bonusCartons: { type: Number, default: 0, min: 0 },
+    bonusPieces: { type: Number, default: 0, min: 0 },
     // For loan type: customer info
     loanCustomer: {
       type: String,
