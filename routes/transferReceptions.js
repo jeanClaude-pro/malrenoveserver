@@ -7,6 +7,7 @@ const Transfer = require("../models/Transfer");
 const Product = require("../models/Product");
 const StockMovement = require("../models/StockMovement");
 const authMiddleware = require("../middleware/auth");
+const { parsePagination, aggregatePage } = require("../utils/pagination");
 const { scopedFilter, adjustBranchStock } = require("../utils/branchContext");
 
 function buildTimeframeFilter(query) {
@@ -57,6 +58,7 @@ function buildTimeframeFilter(query) {
 // ==================== GET ALL ====================
 router.get("/", authMiddleware, async (req, res) => {
   try {
+    const { page, limit } = parsePagination(req.query);
     const { status, search } = req.query;
     const filter = {};
 
@@ -78,17 +80,18 @@ router.get("/", authMiddleware, async (req, res) => {
       ];
     }
 
-    const receptions = await TransferReception.find(scopedFilter(filter, req.branchId)).sort({ createdAt: -1 }).lean();
-
-    const activeReceptions = receptions.filter((r) => r.status === "active");
+    const result = await aggregatePage(TransferReception, scopedFilter(filter, req.branchId), page, limit, {
+      statusTotals: [{ $group: { _id: "$status", count: { $sum: 1 }, pieces: { $sum: "$product.totalPieces" } } }],
+    });
+    const receptions = result.data;
     const summary = {
-      total: receptions.length,
-      active: activeReceptions.length,
-      voided: receptions.filter((r) => r.status === "voided").length,
-      totalPiecesReceived: activeReceptions.reduce((sum, r) => sum + r.product.totalPieces, 0),
+      total: result.pagination.totalRecords,
+      active: result.facets.statusTotals?.find(r => r._id === "active")?.count || 0,
+      voided: result.facets.statusTotals?.find(r => r._id === "voided")?.count || 0,
+      totalPiecesReceived: result.facets.statusTotals?.find(r => r._id === "active")?.pieces || 0,
     };
 
-    res.json({ success: true, data: receptions, summary });
+    res.json({ success: true, data: receptions, summary, pagination: result.pagination });
   } catch (error) {
     console.error("Error fetching receptions:", error);
     res.status(500).json({ error: "Failed to fetch receptions" });

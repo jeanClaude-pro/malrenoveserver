@@ -181,6 +181,7 @@ transferSchema.index({ status: 1 });
 transferSchema.index({ destinationAgency: 1 });
 transferSchema.index({ "transport.vehiclePlate": 1 });
 transferSchema.index({ createdAt: -1 });
+transferSchema.index({ branchId: 1, status: 1, createdAt: -1, _id: -1 });
 
 module.exports =
   mongoose.models.Transfer || mongoose.model("Transfer", transferSchema);

@@ -99,6 +99,7 @@ stockMovementSchema.index({ productId: 1, createdAt: -1 });
 stockMovementSchema.index({ type: 1 });
 stockMovementSchema.index({ loanPaid: 1 });
 stockMovementSchema.index({ createdAt: -1 });
+stockMovementSchema.index({ branchId: 1, productId: 1, createdAt: -1, _id: -1 });
 
 module.exports =
   mongoose.models.StockMovement ||

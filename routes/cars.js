@@ -6,6 +6,7 @@ const CarTrip = require("../models/Cars");
 const Product = require("../models/Product");
 const StockMovement = require("../models/StockMovement");
 const authMiddleware = require("../middleware/auth");
+const { parsePagination, aggregatePage } = require("../utils/pagination");
 const {
   scopedFilter,
   adjustBranchStock,
@@ -277,6 +278,7 @@ function buildTimeframeFilter(query) {
 // ==================== GET ALL CAR TRIPS (with filters) ====================
 router.get("/", authMiddleware, async (req, res) => {
   try {
+    const { page, limit } = parsePagination(req.query);
     const { status, plateNumber, driverPhone, origin, destination } = req.query;
     
     // Build filter
@@ -297,21 +299,38 @@ router.get("/", authMiddleware, async (req, res) => {
     if (origin) filter.origin = { $regex: origin, $options: "i" };
     if (destination) filter.destination = { $regex: destination, $options: "i" };
     
-    const trips = await CarTrip.find(scopedFilter(filter, req.branchId))
-      .sort({ departureTime: -1 })
-      .lean();
+    const result = await aggregatePage(CarTrip, scopedFilter(filter, req.branchId), page, limit, {
+      statusTotals: [{ $group: { _id: "$status", count: { $sum: 1 } } }],
+      tripTotals: [
+        { $project: {
+          totalPieces: { $cond: [
+            { $gt: [{ $size: { $ifNull: ["$products", []] } }, 0] },
+            { $sum: "$products.totalPieces" },
+            { $ifNull: ["$cargo.totalPieces", 0] },
+          ] },
+          totalValue: { $cond: [
+            { $gt: [{ $size: { $ifNull: ["$products", []] } }, 0] },
+            { $sum: "$products.value" },
+            { $ifNull: ["$cargo.value", 0] },
+          ] },
+          totalCost: { $ifNull: ["$totalCost", 0] },
+        } },
+        { $group: { _id: null, totalPieces: { $sum: "$totalPieces" }, totalValue: { $sum: "$totalValue" }, totalCost: { $sum: "$totalCost" } } },
+      ],
+    });
+    const trips = result.data;
     
     // Calculate summary statistics
     const summary = {
-      totalTrips: trips.length,
-      planned: trips.filter(t => t.status === "planned").length,
-      enRoute: trips.filter(t => t.status === "en_route").length,
-      arrived: trips.filter(t => t.status === "arrived").length,
-      completed: trips.filter(t => t.status === "completed").length,
-      cancelled: trips.filter(t => t.status === "cancelled").length,
-      totalPiecesTransported: trips.reduce((sum, trip) => sum + totalTripPieces(trip), 0),
-      totalValue: trips.reduce((sum, trip) => sum + totalTripValue(trip), 0),
-      totalCost: trips.reduce((sum, trip) => sum + (trip.totalCost || 0), 0),
+      totalTrips: result.pagination.totalRecords,
+      planned: result.facets.statusTotals?.find(t => t._id === "planned")?.count || 0,
+      enRoute: result.facets.statusTotals?.find(t => t._id === "en_route")?.count || 0,
+      arrived: result.facets.statusTotals?.find(t => t._id === "arrived")?.count || 0,
+      completed: result.facets.statusTotals?.find(t => t._id === "completed")?.count || 0,
+      cancelled: result.facets.statusTotals?.find(t => t._id === "cancelled")?.count || 0,
+      totalPiecesTransported: result.facets.tripTotals?.[0]?.totalPieces || 0,
+      totalValue: result.facets.tripTotals?.[0]?.totalValue || 0,
+      totalCost: result.facets.tripTotals?.[0]?.totalCost || 0,
     };
     
     res.json({
@@ -319,6 +338,7 @@ router.get("/", authMiddleware, async (req, res) => {
       data: trips,
       summary,
       count: trips.length,
+      pagination: result.pagination,
     });
   } catch (error) {
     console.error("Error fetching car trips:", error);

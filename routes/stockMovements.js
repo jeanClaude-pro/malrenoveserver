@@ -168,20 +168,39 @@ router.get("/ledger/:productId", authMiddleware, async (req, res) => {
     // Every movement from the period start onward (no upper bound) — needed to walk
     // both the starting-of-period balance and the ending-of-period balance back from
     // the current, authoritative stock figure.
-    const movements = await StockMovement.find(scopedFilter({
-      productId,
-      createdAt: { $gte: period.start },
-    }, req.branchId))
-      .sort({ createdAt: 1 })
-      .lean();
+    const [ledgerAggregation = {}] = await StockMovement.aggregate([
+      { $match: scopedFilter({
+        productId: new mongoose.Types.ObjectId(productId),
+        createdAt: { $gte: period.start },
+      }, req.branchId) },
+      { $facet: {
+        movements: [{ $sort: { createdAt: 1, _id: 1 } }],
+        totals: [
+          { $addFields: {
+            signed: { $cond: [{ $in: ["$type", Array.from(DECREASE_TYPES)] }, { $multiply: ["$quantity", -1] }, "$quantity"] },
+            bonusTotal: { $add: [
+              { $multiply: [{ $ifNull: ["$bonusCartons", 0] }, { $ifNull: ["$piecesPerCarton", 1] }] },
+              { $ifNull: ["$bonusPieces", 0] },
+            ] },
+          } },
+          { $group: {
+            _id: null,
+            sumFromStart: { $sum: "$signed" },
+            sumAfterEnd: { $sum: { $cond: [{ $gt: ["$createdAt", period.end] }, "$signed", 0] } },
+            added: { $sum: { $cond: [{ $and: [{ $lte: ["$createdAt", period.end] }, { $gt: ["$signed", 0] }] }, "$signed", 0] } },
+            removed: { $sum: { $cond: [{ $and: [{ $lte: ["$createdAt", period.end] }, { $lt: ["$signed", 0] }] }, { $multiply: ["$signed", -1] }, 0] } },
+            soldPhysical: { $sum: { $cond: [{ $and: [{ $lte: ["$createdAt", period.end] }, { $eq: ["$type", "sale"] }] }, "$quantity", 0] } },
+            bonusPhysical: { $sum: { $cond: [{ $and: [{ $lte: ["$createdAt", period.end] }, { $eq: ["$type", "sale"] }] }, "$bonusTotal", 0] } },
+            soldTransactions: { $sum: { $cond: [{ $and: [{ $lte: ["$createdAt", period.end] }, { $eq: ["$type", "sale"] }] }, 1, 0] } },
+          } },
+        ],
+      } },
+    ]);
+    const movements = ledgerAggregation.movements || [];
+    const aggregateTotals = ledgerAggregation.totals?.[0] || {};
 
-    let sumFromStart = 0;
-    let sumAfterEnd = 0;
-    for (const movement of movements) {
-      const signed = signedQuantity(movement);
-      sumFromStart += signed;
-      if (movement.createdAt > period.end) sumAfterEnd += signed;
-    }
+    const sumFromStart = aggregateTotals.sumFromStart || 0;
+    const sumAfterEnd = aggregateTotals.sumAfterEnd || 0;
 
     const startingStock = currentStock - sumFromStart;
     const endingStock = currentStock - sumAfterEnd;
@@ -240,6 +259,14 @@ router.get("/ledger/:productId", authMiddleware, async (req, res) => {
       });
     }
     actions.reverse(); // most recent first, matching every other history view in the app
+
+    // Database aggregates are authoritative for summary numbers. The loop above
+    // only builds the compact non-sale audit rows and their running snapshots.
+    added = aggregateTotals.added || 0;
+    removed = aggregateTotals.removed || 0;
+    soldTransactionsCount = aggregateTotals.soldTransactions || 0;
+    bonusQtyPieces = aggregateTotals.bonusPhysical || 0;
+    soldQtyPieces = Math.max(0, Number(aggregateTotals.soldPhysical || 0) - bonusQtyPieces);
 
     const productPpc = product.piecesPerCarton || 1;
     const sold = splitBoxes(soldQtyPieces, productPpc);

@@ -82,5 +82,6 @@ transferReceptionSchema.index({ "product.productId": 1 });
 // receptionId already gets a unique index from its field-level `unique: true` above —
 // declaring it again here was the cause of the "Duplicate schema index" Mongoose warning.
 transferReceptionSchema.index({ transferId: 1 }, { unique: true, sparse: true });
+transferReceptionSchema.index({ branchId: 1, status: 1, createdAt: -1, _id: -1 });
 
 module.exports = mongoose.model("TransferReception", transferReceptionSchema);

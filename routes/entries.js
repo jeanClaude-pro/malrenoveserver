@@ -3,6 +3,7 @@ const router = express.Router();
 const mongoose = require("mongoose");
 const Entry = require("../models/Entry");
 const authMiddleware = require("../middleware/auth");
+const { parsePagination, paginationMeta } = require("../utils/pagination");
 const { scopedFilter } = require("../utils/branchContext");
 
 // ==================== TIME FRAME HELPER FUNCTIONS ====================
@@ -174,6 +175,7 @@ function normalizePaymentMethod(pm) {
  */
 router.get("/", authMiddleware, async (req, res) => {
   try {
+    const { page, limit, skip } = parsePagination(req.query);
     const { 
       category,
       source,
@@ -237,40 +239,42 @@ router.get("/", authMiddleware, async (req, res) => {
     }
 
     // Execute query - get ALL records within timeframe (no skip/limit)
-    const entries = await Entry.find(scopedFilter(filter, req.branchId))
+    const match = scopedFilter(filter, req.branchId);
+    const [entries, total, groupedTotals] = await Promise.all([
+      Entry.find(match)
       .populate("createdBy", "username email")
       .populate("updatedBy", "username")
-      .select('-__v') // Exclude version key
-      .sort({ createdAt: -1 }) // Newest first
-      .lean();
-
-    // Get count for metadata
-    const total = entries.length;
+      .select('-__v')
+      .sort({ createdAt: -1, _id: -1 })
+      .skip(skip).limit(limit).lean(),
+      Entry.countDocuments(match),
+      Entry.aggregate([{ $match: match }, { $group: { _id: { status: "$status", paymentMethod: "$paymentMethod", category: "$category" }, count: { $sum: 1 }, amount: { $sum: "$amount" } } }]),
+    ]);
 
     // Generate timeframe metadata
     const timeframeDescription = getTimeframeDescription(req.query);
     const timeframeFilter = buildTimeframeFilter(req.query);
 
     // Calculate totals for quick insights
-    const totals = entries.reduce((acc, entry) => {
-      acc.totalAmount += entry.amount;
+    const totals = groupedTotals.reduce((acc, row) => {
+      acc.totalAmount += row.amount;
       
       // Count by status
-      if (entry.status === "active") {
-        acc.activeCount += 1;
-        acc.activeAmount += entry.amount;
-      } else if (entry.status === "deleted") {
-        acc.deletedCount += 1;
-        acc.deletedAmount += entry.amount;
+      if (row._id.status === "active") {
+        acc.activeCount += row.count;
+        acc.activeAmount += row.amount;
+      } else if (row._id.status === "deleted") {
+        acc.deletedCount += row.count;
+        acc.deletedAmount += row.amount;
       }
       
       // Count by payment method
-      acc.paymentMethods[entry.paymentMethod] = 
-        (acc.paymentMethods[entry.paymentMethod] || 0) + entry.amount;
+      acc.paymentMethods[row._id.paymentMethod] =
+        (acc.paymentMethods[row._id.paymentMethod] || 0) + row.amount;
       
       // Count by category
-      acc.categories[entry.category] = 
-        (acc.categories[entry.category] || 0) + entry.amount;
+      acc.categories[row._id.category] =
+        (acc.categories[row._id.category] || 0) + row.amount;
       
       return acc;
     }, {
@@ -313,6 +317,7 @@ router.get("/", authMiddleware, async (req, res) => {
         categories: totals.categories,
         paymentMethods: totals.paymentMethods
       },
+      pagination: paginationMeta(page, limit, total),
       filtersApplied: {
         status: status || 'default (active only)',
         category: category || 'none',

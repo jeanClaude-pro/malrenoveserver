@@ -269,5 +269,6 @@ carTripSchema.index({ departureTime: -1 });
 carTripSchema.index({ "driver.phone": 1 });
 carTripSchema.index({ "vehicle.plateNumber": 1 });
 carTripSchema.index({ createdAt: -1 });
+carTripSchema.index({ branchId: 1, createdAt: -1, _id: -1 });
 
 module.exports = mongoose.models.CarTrip || mongoose.model("CarTrip", carTripSchema);

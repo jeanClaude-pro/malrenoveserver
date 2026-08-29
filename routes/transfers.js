@@ -7,6 +7,7 @@ const Product = require("../models/Product");
 const StockMovement = require("../models/StockMovement");
 const TransferReception = require("../models/TransferReception");
 const authMiddleware = require("../middleware/auth");
+const { parsePagination, aggregatePage } = require("../utils/pagination");
 const { scopedFilter, adjustBranchStock } = require("../utils/branchContext");
 
 // Helper function to generate a unique transfer ID
@@ -83,6 +84,7 @@ async function hasEnoughStock(productId, totalPieces, branchId) {
 // ==================== GET ALL TRANSFERS (with filters) ====================
 router.get("/", authMiddleware, async (req, res) => {
   try {
+    const { page, limit } = parsePagination(req.query);
     const { status, destinationAgency, vehiclePlate, search } = req.query;
 
     const filter = {};
@@ -113,15 +115,18 @@ router.get("/", authMiddleware, async (req, res) => {
       ];
     }
 
-    const transfers = await Transfer.find(scopedFilter(filter, req.branchId)).sort({ createdAt: -1 }).lean();
+    const result = await aggregatePage(Transfer, scopedFilter(filter, req.branchId), page, limit, {
+      statusTotals: [{ $group: { _id: "$status", count: { $sum: 1 }, pieces: { $sum: "$product.totalPieces" } } }],
+    });
+    const transfers = result.data;
 
     const summary = {
-      total: transfers.length,
-      pending: transfers.filter((t) => t.status === "pending").length,
-      inTransit: transfers.filter((t) => t.status === "in_transit").length,
-      delivered: transfers.filter((t) => t.status === "delivered").length,
-      cancelled: transfers.filter((t) => t.status === "cancelled").length,
-      totalPiecesTransferred: transfers.reduce((sum, t) => sum + (t.product?.totalPieces || 0), 0),
+      total: result.pagination.totalRecords,
+      pending: result.facets.statusTotals?.find(t => t._id === "pending")?.count || 0,
+      inTransit: result.facets.statusTotals?.find(t => t._id === "in_transit")?.count || 0,
+      delivered: result.facets.statusTotals?.find(t => t._id === "delivered")?.count || 0,
+      cancelled: result.facets.statusTotals?.find(t => t._id === "cancelled")?.count || 0,
+      totalPiecesTransferred: (result.facets.statusTotals || []).reduce((sum, t) => sum + Number(t.pieces || 0), 0),
     };
 
     res.json({
@@ -129,6 +134,7 @@ router.get("/", authMiddleware, async (req, res) => {
       data: transfers,
       summary,
       count: transfers.length,
+      pagination: result.pagination,
     });
   } catch (error) {
     console.error("Error fetching transfers:", error);

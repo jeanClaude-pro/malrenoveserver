@@ -313,6 +313,9 @@ saleSchema.index({ "customer.phone": 1 }); // Keep this explicit index
 saleSchema.index({ salesPerson: 1 });
 saleSchema.index({ type: 1 }); // Add index for type (sale/reservation/expense)
 saleSchema.index({ status: 1 });
+saleSchema.index({ branchId: 1, createdAt: -1, _id: -1 });
+saleSchema.index({ branchId: 1, paymentType: 1, "creditDetails.fullyPaid": 1, createdAt: -1 });
+saleSchema.index({ branchId: 1, "creditDetails.payments.status": 1, "creditDetails.payments.confirmedAt": -1 });
 
 // ✅ FIXED: Pre-save middleware (async style — NO next())
 saleSchema.pre("save", async function () {

@@ -2,6 +2,7 @@ const express = require("express");
 const router = express.Router();
 const Expense = require("../models/Expense");
 const authMiddleware = require("../middleware/auth");
+const { parsePagination, paginationMeta } = require("../utils/pagination");
 const { scopedFilter } = require("../utils/branchContext");
 const nodemailer = require("nodemailer");
 
@@ -399,6 +400,7 @@ function isAdminUser(user) {
  */
 router.get("/", authMiddleware, async (req, res) => {
   try {
+    const { page, limit, skip } = parsePagination(req.query);
     const { 
       status, 
       paymentMethod, 
@@ -456,31 +458,30 @@ router.get("/", authMiddleware, async (req, res) => {
     }
 
     // Execute query - get ALL records within timeframe (no skip/limit)
-    const expenses = await Expense.find(scopedFilter(filter, req.branchId))
-      .select('-__v') // Exclude version key
-      .sort({ createdAt: -1 }) // Newest first
-      .lean();
-
-    // Get count for metadata
-    const total = expenses.length;
+    const match = scopedFilter(filter, req.branchId);
+    const [expenses, total, groupedTotals] = await Promise.all([
+      Expense.find(match).select('-__v').sort({ createdAt: -1, _id: -1 }).skip(skip).limit(limit).lean(),
+      Expense.countDocuments(match),
+      Expense.aggregate([{ $match: match }, { $group: { _id: "$status", count: { $sum: 1 }, amount: { $sum: "$amount" } } }]),
+    ]);
 
     // Generate timeframe metadata
     const timeframeDescription = getTimeframeDescription(req.query);
     const timeframeFilter = buildTimeframeFilter(req.query);
 
     // Calculate totals for quick insights
-    const totals = expenses.reduce((acc, expense) => {
-      acc.totalAmount += expense.amount;
+    const totals = groupedTotals.reduce((acc, row) => {
+      acc.totalAmount += row.amount;
       
-      if (expense.status === "pending") {
-        acc.pendingCount += 1;
-        acc.pendingAmount += expense.amount;
-      } else if (expense.status === "validated") {
-        acc.validatedCount += 1;
-        acc.validatedAmount += expense.amount;
-      } else if (expense.status === "rejected") {
-        acc.rejectedCount += 1;
-        acc.rejectedAmount += expense.amount;
+      if (row._id === "pending") {
+        acc.pendingCount += row.count;
+        acc.pendingAmount += row.amount;
+      } else if (row._id === "validated") {
+        acc.validatedCount += row.count;
+        acc.validatedAmount += row.amount;
+      } else if (row._id === "rejected") {
+        acc.rejectedCount += row.count;
+        acc.rejectedAmount += row.amount;
       }
       
       return acc;
@@ -526,6 +527,7 @@ router.get("/", authMiddleware, async (req, res) => {
           amount: totals.rejectedAmount
         }
       },
+      pagination: paginationMeta(page, limit, total),
       filtersApplied: {
         status: status || 'default (all statuses)',
         paymentMethod: paymentMethod || 'none',

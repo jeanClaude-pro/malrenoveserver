@@ -9,6 +9,7 @@ const Product = require("../models/Product");
 const ExchangeRate = require("../models/ExchangeRate");
 const StockMovement = require("../models/StockMovement");
 const authMiddleware = require("../middleware/auth");
+const { parsePagination, aggregatePage } = require("../utils/pagination");
 const {
   branchScope,
   scopedFilter,
@@ -438,10 +439,12 @@ function getTimeframeDescription(query) {
  */
 router.get("/", authMiddleware, async (req, res) => {
   try {
+    const { page, limit } = parsePagination(req.query);
     const { 
       customerPhone, 
       status,
-      type
+      type,
+      creditFilter
     } = req.query;
     
     // Build the main filter object
@@ -478,15 +481,38 @@ router.get("/", authMiddleware, async (req, res) => {
       // Default: include all types
       filter.type = { $in: ["sale", "reservation", "expense"] };
     }
+    if (creditFilter && creditFilter !== "all") {
+      filter.paymentType = "credit";
+      if (creditFilter === "credit_pending") {
+        filter["creditDetails.amountPaid"] = { $lte: 0 };
+        filter["creditDetails.amountDue"] = { $gt: 0 };
+      } else if (creditFilter === "credit_partial") {
+        filter["creditDetails.amountPaid"] = { $gt: 0 };
+        filter["creditDetails.amountDue"] = { $gt: 0 };
+      } else if (creditFilter === "credit_paid") {
+        filter["creditDetails.fullyPaid"] = true;
+      }
+    }
     
     // Execute query - get ALL records within timeframe (no skip/limit)
-    const sales = await Sale.find(scopedFilter(filter, req.branchId))
-      .select('-__v') // Exclude version key
-      .sort({ createdAt: -1 }) // Newest first as requested
-      .lean();
-    
-    // Get count for metadata
-    const total = sales.length;
+    const pageResult = await aggregatePage(
+      Sale,
+      scopedFilter(filter, req.branchId),
+      page,
+      limit,
+      {
+        operationalTotals: [{
+          $group: {
+            _id: null,
+            totalExpenses: { $sum: { $cond: [{ $eq: ["$type", "expense"] }, "$total", 0] } },
+            saleCount: { $sum: { $cond: [{ $ne: ["$type", "expense"] }, 1, 0] } },
+            expenseCount: { $sum: { $cond: [{ $eq: ["$type", "expense"] }, 1, 0] } },
+          },
+        }],
+      }
+    );
+    const sales = pageResult.data;
+    const total = pageResult.pagination.totalRecords;
     
     // Generate timeframe metadata
     const timeframeDescription = getTimeframeDescription(req.query);
@@ -494,19 +520,9 @@ router.get("/", authMiddleware, async (req, res) => {
     
     // Calculate operational totals for quick insights. Revenue itself is
     // calculated from receipt events below, not from credit invoice totals.
-    const totals = sales.reduce((acc, sale) => {
-      if (sale.type === "expense") {
-        acc.totalExpenses += sale.total;
-        acc.expenseCount += 1;
-      } else {
-        acc.saleCount += 1;
-      }
-      return acc;
-    }, {
-      totalExpenses: 0,
-      saleCount: 0,
-      expenseCount: 0
-    });
+    const totals = pageResult.facets.operationalTotals?.[0] || {
+      totalExpenses: 0, saleCount: 0, expenseCount: 0,
+    };
     const revenueScope = {
       ...(customerPhone && { "customer.phone": customerPhone }),
       ...(status ? { status } : { status: { $in: ["completed", "pending", "expense"] } }),
@@ -545,6 +561,7 @@ router.get("/", authMiddleware, async (req, res) => {
         salesCount: totals.saleCount,
         expensesCount: totals.expenseCount
       },
+      pagination: pageResult.pagination,
       revenueEvents: receivedRevenue.events,
       filtersApplied: {
         customerPhone: customerPhone || 'none',
@@ -877,6 +894,7 @@ router.post("/", authMiddleware, async (req, res) => {
     }
 
     const total = subtotal;
+
     const saleId = `Vente-${Date.now()}-${Math.random()
       .toString(36)
       .substr(2, 5)
@@ -1370,6 +1388,27 @@ router.put("/:id", authMiddleware, async (req, res) => {
 
     const total = subtotal;
 
+    // Confirmed payment history is immutable financial evidence. Reconcile
+    // counters from payment events whenever a credit invoice total is edited.
+    let reconciledCreditDetails = null;
+    if (originalSale.paymentType === "credit") {
+      const payments = originalSale.creditDetails?.payments || [];
+      const confirmedAmount = Math.round(payments.reduce((sum, payment) =>
+        sum + ((!payment.status || payment.status === "confirmed") ? Number(payment.amount || 0) : 0), 0) * 100) / 100;
+      const pendingAmount = Math.round(payments.reduce((sum, payment) =>
+        sum + (payment.status === "pending" ? Number(payment.amount || 0) : 0), 0) * 100) / 100;
+      if (total + 0.001 < confirmedAmount + pendingAmount) {
+        return res.status(409).json({
+          error: `Le nouveau total ne peut pas être inférieur aux paiements confirmés et en attente (${(confirmedAmount + pendingAmount).toFixed(2)} USD)`,
+        });
+      }
+      reconciledCreditDetails = {
+        "creditDetails.amountPaid": confirmedAmount,
+        "creditDetails.amountDue": Math.max(0, Math.round((total - confirmedAmount) * 100) / 100),
+        "creditDetails.pendingAmount": pendingAmount,
+        "creditDetails.fullyPaid": total - confirmedAmount <= 0.009,
+      };
+    }
     // Calculate stock adjustments
     //do a great job
     const stockAdjustments = [];
@@ -1481,6 +1520,7 @@ router.put("/:id", authMiddleware, async (req, res) => {
           reservationDate: reservationDate || originalSale.reservationDate,
           reservationTime: reservationTime || originalSale.reservationTime,
           notes: notes || originalSale.notes,
+          ...(reconciledCreditDetails || {}),
           editedBy: req.user.id,
           editedAt: new Date(),
           $push: {
@@ -1714,6 +1754,15 @@ router.patch(
   async (req, res) => {
     try {
       const { id, paymentId } = req.params;
+      // Keep the authorization decision on the server. Superadmin is explicitly
+      // included; branch authority still comes exclusively from authMiddleware
+      // and every read/update below remains scoped to req.branchId.
+      const confirmationRoles = new Set([
+        "superadmin", "admin", "manager", "inventory_manager", "cashier_supervisor", "staff",
+      ]);
+      if (!confirmationRoles.has(req.user.role)) {
+        return res.status(403).json({ error: "Vous n'êtes pas autorisé à confirmer ce paiement" });
+      }
       const sale = await Sale.findOne(scopedFilter({ _id: id }, req.branchId)).lean();
       if (!sale) return res.status(404).json({ error: "Vente non trouvée" });
       if (sale.paymentType !== "credit") {

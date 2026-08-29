@@ -54,5 +54,6 @@ const customerSchema = new mongoose.Schema({
 // NOTE: Removed duplicate index for phone (already created by unique: true)
 customerSchema.index({ name: "text" });
 customerSchema.index({ totalSpent: -1 });
+customerSchema.index({ branches: 1, lastPurchaseDate: -1 });
 
 module.exports = mongoose.model("Customer", customerSchema);
