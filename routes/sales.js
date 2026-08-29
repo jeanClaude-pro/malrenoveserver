@@ -925,14 +925,12 @@ router.post("/", authMiddleware, async (req, res) => {
         });
       }
       creditDetailsData = {
-        // An advance is only a reported payment until the seller explicitly
-        // acknowledges receipt. The receivable therefore starts at the full
-        // invoice amount.
-        amountPaid: 0,
-        amountDue: total,
-        pendingAmount: initialPaid,
+        // Saving the sale confirms that this advance was actually received.
+        amountPaid: initialPaid,
+        amountDue: Math.max(0, Math.round((total - initialPaid) * 100) / 100),
+        pendingAmount: 0,
         dueDate: creditDueDate ? new Date(creditDueDate) : null,
-        fullyPaid: false,
+        fullyPaid: total - initialPaid <= 0.009,
         payments:
           initialPaid > 0
             ? [
@@ -943,7 +941,9 @@ router.post("/", authMiddleware, async (req, res) => {
                   method: normalizedPM,
                   recordedBy: req.user.username || req.user.name || "Unknown",
                   notes: "Versement initial",
-                  status: "pending",
+                  status: "confirmed",
+                  confirmedAt: new Date(),
+                  confirmedBy: req.user.username || req.user.id,
                 },
               ]
             : [],
@@ -1633,10 +1633,7 @@ router.patch("/:id/pending", authMiddleware, async (req, res) => {
   }
 });
 
-/**
- * Record a payment event without treating it as received cash. paymentId is an
- * idempotency key supplied by the client and is scoped to this sale.
- */
+/** Record and confirm received credit cash atomically. */
 router.patch("/:id/credit-payment", authMiddleware, async (req, res) => {
   try {
     const { id } = req.params;
@@ -1655,38 +1652,37 @@ router.patch("/:id/credit-payment", authMiddleware, async (req, res) => {
     }
 
     const normalizedMethod = normalizePaymentMethod(method || "cash");
+    const confirmedAt = new Date();
+    const confirmedBy = req.user.username || req.user.id;
     const updatedSale = await Sale.findOneAndUpdate(
       {
         ...scopedFilter({ _id: id }, req.branchId),
         paymentType: "credit",
         status: VALID_REVENUE_STATUS_FILTER,
         "creditDetails.payments.paymentId": { $ne: paymentId },
-        $expr: {
-          $lte: [
-            {
-              $add: [
-                { $ifNull: ["$creditDetails.pendingAmount", 0] },
-                paymentAmount,
+        $expr: { $lte: [paymentAmount, { $ifNull: ["$creditDetails.amountDue", "$total"] }] },
+      },
+      [
+        {
+          $set: {
+            "creditDetails.amountPaid": {
+              $add: [{ $ifNull: ["$creditDetails.amountPaid", 0] }, paymentAmount],
+            },
+            "creditDetails.amountDue": {
+              $max: [0, { $subtract: [{ $ifNull: ["$creditDetails.amountDue", "$total"] }, paymentAmount] }],
+            },
+            "creditDetails.payments": {
+              $concatArrays: [
+                { $ifNull: ["$creditDetails.payments", []] },
+                [{ paymentId, amount: paymentAmount, date: confirmedAt, method: normalizedMethod,
+                  recordedBy: confirmedBy, notes: notes || "", status: "confirmed",
+                  confirmedAt, confirmedBy }],
               ],
             },
-            { $ifNull: ["$creditDetails.amountDue", "$total"] },
-          ],
-        },
-      },
-      {
-        $inc: { "creditDetails.pendingAmount": paymentAmount },
-        $push: {
-          "creditDetails.payments": {
-            paymentId,
-            amount: paymentAmount,
-            date: new Date(),
-            method: normalizedMethod,
-            recordedBy: req.user.username || req.user.id,
-            notes: notes || "",
-            status: "pending",
           },
         },
-      },
+        { $set: { "creditDetails.fullyPaid": { $lte: ["$creditDetails.amountDue", 0.009] } } },
+      ],
       { new: true, runValidators: true }
     );
 
@@ -1716,17 +1712,13 @@ router.patch("/:id/credit-payment", authMiddleware, async (req, res) => {
         return res.json({
           success: true,
           idempotent: true,
-          message: "Paiement déjà enregistré et en attente de confirmation",
+          message: "Paiement déjà reçu et comptabilisé",
           payment: existing,
           sale,
         });
       }
 
-      const available = Math.max(
-        0,
-        Number(sale.creditDetails?.amountDue ?? sale.total) -
-          Number(sale.creditDetails?.pendingAmount || 0)
-      );
+      const available = Math.max(0, Number(sale.creditDetails?.amountDue ?? sale.total));
       return res.status(409).json({
         error: `Le paiement dépasse le solde disponible (${available.toFixed(2)} USD)`,
       });
@@ -1735,14 +1727,16 @@ router.patch("/:id/credit-payment", authMiddleware, async (req, res) => {
     const payment = updatedSale.creditDetails.payments.find(
       (candidate) => candidate.paymentId === paymentId
     );
-    return res.status(202).json({
+    return res.json({
       success: true,
-      message: "Paiement enregistré; confirmez sa réception avant l'encaissement",
+      message: updatedSale.creditDetails.fullyPaid
+        ? "Paiement reçu et crédit entièrement soldé"
+        : "Paiement reçu et dette mise à jour",
       payment,
       sale: updatedSale,
     });
   } catch (error) {
-    console.error("Error recording pending credit payment:", error);
+    console.error("Error recording credit payment:", error);
     return res.status(500).json({ error: "Échec de l'enregistrement du paiement" });
   }
 });
