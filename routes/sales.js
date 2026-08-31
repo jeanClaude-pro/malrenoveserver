@@ -1650,39 +1650,89 @@ router.patch("/:id/credit-payment", authMiddleware, async (req, res) => {
     if (!paymentId || paymentId.length > 128) {
       return res.status(400).json({ error: "L'identifiant paymentId est requis" });
     }
+    if (!mongoose.isObjectIdOrHexString(id)) {
+      return res.status(400).json({ error: "Identifiant de vente invalide" });
+    }
 
     const normalizedMethod = normalizePaymentMethod(method || "cash");
     const confirmedAt = new Date();
     const confirmedBy = req.user.username || req.user.id;
+    const currentSale = await Sale.findOne(
+      scopedFilter({ _id: id }, req.branchId)
+    ).lean();
+
+    if (!currentSale) return res.status(404).json({ error: "Vente non trouvée" });
+    if (currentSale.paymentType !== "credit") {
+      return res.status(400).json({ error: "Cette vente n'est pas à crédit" });
+    }
+    if (["voided", "corrected", "cancelled", "refunded"].includes(currentSale.status)) {
+      return res.status(400).json({ error: "Aucun paiement ne peut être ajouté à cette vente" });
+    }
+
+    const existingPayment = currentSale.creditDetails?.payments?.find(
+      (payment) => payment.paymentId === paymentId
+    );
+    if (existingPayment) {
+      if (
+        Math.abs(Number(existingPayment.amount) - paymentAmount) > 0.001 ||
+        existingPayment.method !== normalizedMethod ||
+        String(existingPayment.notes || "") !== String(notes || "")
+      ) {
+        return res.status(409).json({
+          error: "Ce paymentId est déjà utilisé avec des données différentes",
+        });
+      }
+      return res.json({
+        success: true,
+        idempotent: true,
+        message: "Paiement déjà reçu et comptabilisé",
+        payment: existingPayment,
+        sale: currentSale,
+      });
+    }
+
+    const currentDue = Math.max(
+      0,
+      Number(currentSale.creditDetails?.amountDue ?? currentSale.total)
+    );
+    if (paymentAmount > currentDue + 0.001) {
+      return res.status(409).json({
+        error: `Le paiement dépasse le solde disponible (${currentDue.toFixed(2)} USD)`,
+      });
+    }
+
+    const currentPaid = Math.max(
+      0,
+      Number(currentSale.creditDetails?.amountPaid || 0)
+    );
+    const remainingDue = Math.max(0, Math.round((currentDue - paymentAmount) * 100) / 100);
     const updatedSale = await Sale.findOneAndUpdate(
       {
         ...scopedFilter({ _id: id }, req.branchId),
         paymentType: "credit",
         status: VALID_REVENUE_STATUS_FILTER,
         "creditDetails.payments.paymentId": { $ne: paymentId },
-        $expr: { $lte: [paymentAmount, { $ifNull: ["$creditDetails.amountDue", "$total"] }] },
+        // Optimistic concurrency guard: only update the balance we just read.
+        // This keeps simultaneous payments from overwriting each other while
+        // avoiding an aggregation-pipeline update, which is less portable
+        // across the MongoDB/Mongoose versions used by deployments.
+        "creditDetails.amountDue": currentSale.creditDetails?.amountDue ?? null,
+        "creditDetails.amountPaid": currentSale.creditDetails?.amountPaid ?? null,
       },
-      [
-        {
-          $set: {
-            "creditDetails.amountPaid": {
-              $add: [{ $ifNull: ["$creditDetails.amountPaid", 0] }, paymentAmount],
-            },
-            "creditDetails.amountDue": {
-              $max: [0, { $subtract: [{ $ifNull: ["$creditDetails.amountDue", "$total"] }, paymentAmount] }],
-            },
-            "creditDetails.payments": {
-              $concatArrays: [
-                { $ifNull: ["$creditDetails.payments", []] },
-                [{ paymentId, amount: paymentAmount, date: confirmedAt, method: normalizedMethod,
-                  recordedBy: confirmedBy, notes: notes || "", status: "confirmed",
-                  confirmedAt, confirmedBy }],
-              ],
-            },
+      {
+        $set: {
+          "creditDetails.amountPaid": Math.round((currentPaid + paymentAmount) * 100) / 100,
+          "creditDetails.amountDue": remainingDue,
+          "creditDetails.fullyPaid": remainingDue <= 0.009,
+        },
+        $push: {
+          "creditDetails.payments": {
+            paymentId, amount: paymentAmount, date: confirmedAt, method: normalizedMethod,
+            recordedBy: confirmedBy, notes: notes || "", status: "confirmed",
+            confirmedAt, confirmedBy,
           },
         },
-        { $set: { "creditDetails.fullyPaid": { $lte: ["$creditDetails.amountDue", 0.009] } } },
-      ],
+      },
       { new: true, runValidators: true }
     );
 
