@@ -9,7 +9,14 @@ const Product = require("../models/Product");
 const ExchangeRate = require("../models/ExchangeRate");
 const StockMovement = require("../models/StockMovement");
 const authMiddleware = require("../middleware/auth");
-const { parsePagination, aggregatePage } = require("../utils/pagination");
+const { parsePagination, paginationMeta, aggregatePage } = require("../utils/pagination");
+const {
+  DEBT_TOLERANCE,
+  calendarDateInAccountingZone,
+  confirmedAmount,
+  normalizeCreditSaleDocument,
+  parsePaymentDate,
+} = require("../utils/creditAccounting");
 const {
   branchScope,
   scopedFilter,
@@ -99,6 +106,39 @@ function getLineTotal(paidPieces, piecesPerCarton, boxPrice) {
 const VALID_REVENUE_STATUS_FILTER = {
   $nin: ["voided", "corrected", "cancelled", "refunded"],
 };
+function escapeRegex(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function normalizedCreditStages() {
+  return [
+    { $set: { "creditDetails.payments": { $ifNull: ["$creditDetails.payments", []] } } },
+    { $set: {
+      _confirmedPaid: { $round: [{ $cond: [
+        { $gt: [{ $size: "$creditDetails.payments" }, 0] },
+        { $sum: { $map: { input: "$creditDetails.payments", as: "payment", in: { $cond: [
+          { $in: [{ $ifNull: ["$$payment.status", "confirmed"] }, ["confirmed"]] },
+          { $ifNull: ["$$payment.amount", 0] }, 0,
+        ] } } } },
+        { $ifNull: ["$creditDetails.amountPaid", 0] },
+      ] }, 2] },
+      _pendingPaid: { $round: [{ $cond: [
+        { $gt: [{ $size: "$creditDetails.payments" }, 0] },
+        { $sum: { $map: { input: "$creditDetails.payments", as: "payment", in: { $cond: [{ $eq: ["$$payment.status", "pending"] }, { $ifNull: ["$$payment.amount", 0] }, 0] } } } },
+        { $ifNull: ["$creditDetails.pendingAmount", 0] },
+      ] }, 2] },
+    } },
+    { $set: {
+      _outstanding: { $max: [0, { $round: [{ $subtract: ["$total", "$_confirmedPaid"] }, 2] }] },
+      "creditDetails.amountPaid": "$_confirmedPaid",
+      "creditDetails.pendingAmount": "$_pendingPaid",
+    } },
+    { $set: {
+      "creditDetails.amountDue": "$_outstanding",
+      "creditDetails.fullyPaid": { $lte: ["$_outstanding", DEBT_TOLERANCE] },
+    } },
+  ];
+}
 
 // Revenue is cash actually received: immediate-payment sales at sale time, plus
 // credit payments at the time the seller confirms receipt. Credit invoices are
@@ -154,8 +194,8 @@ async function getReceivedRevenue(createdAt, scope = {}, branchId = "butembo") {
           amount: "$creditDetails.payments.amount",
           receivedAt: {
             $ifNull: [
-              "$creditDetails.payments.confirmedAt",
-              "$creditDetails.payments.date",
+              "$creditDetails.payments.paymentDate",
+              { $ifNull: ["$creditDetails.payments.confirmedAt", "$creditDetails.payments.date"] },
             ],
           },
           kind: { $literal: "credit_payment" },
@@ -183,11 +223,13 @@ async function getReceivedRevenue(createdAt, scope = {}, branchId = "butembo") {
 }
 
 // Helper function to update customer data (FIXED)
-async function updateCustomerData(customerData, saleTotal, branchId) {
+async function updateCustomerData(customerData, saleTotal, branchId, session = null) {
   const { name, phone, email } = customerData;
   const now = new Date();
   try {
-    let customer = await Customer.findOne({ phone });
+    let customerQuery = Customer.findOne({ phone });
+    if (session) customerQuery = customerQuery.session(session);
+    let customer = await customerQuery;
     if (customer) {
       if (branchId !== "butembo" && !customer.branchStats?.get("butembo")) {
         customer.branchStats = customer.branchStats || new Map();
@@ -235,12 +277,13 @@ async function updateCustomerData(customerData, saleTotal, branchId) {
         },
       });
     }
-    await customer.save();
+    await customer.save(session ? { session } : undefined);
     
     // RETURN THE CUSTOMER ID
     return customer._id;
   } catch (error) {
     console.error("Error updating customer data:", error);
+    if (session) throw error;
     return null;
   }
 }
@@ -511,7 +554,7 @@ router.get("/", authMiddleware, async (req, res) => {
         }],
       }
     );
-    const sales = pageResult.data;
+    const sales = pageResult.data.map(normalizeCreditSaleDocument);
     const total = pageResult.pagination.totalRecords;
     
     // Generate timeframe metadata
@@ -604,27 +647,63 @@ router.get("/", authMiddleware, async (req, res) => {
 /** ---------- ALL OUTSTANDING CREDIT SALES (not restricted by sale date) ---------- **/
 router.get("/unpaid", authMiddleware, async (req, res) => {
   try {
-    const sales = await Sale.find(scopedFilter({
+    const { page, limit, skip } = parsePagination(req.query);
+    const now = new Date();
+    const baseMatch = scopedFilter({
       paymentType: "credit",
-      "creditDetails.fullyPaid": false,
-      "creditDetails.amountDue": { $gt: 0 },
-      status: { $nin: ["voided", "corrected", "refunded"] },
+      status: { $nin: ["voided", "corrected", "refunded", "cancelled"] },
       type: { $in: ["sale", "reservation"] },
-    }, req.branchId))
-      .select("-__v")
-      .sort({ "creditDetails.dueDate": 1, createdAt: 1 })
-      .lean();
+    }, req.branchId);
+    const pipeline = [{ $match: baseMatch }, ...normalizedCreditStages(), { $match: { _outstanding: { $gt: DEBT_TOLERANCE } } }];
+
+    const search = String(req.query.search || "").trim();
+    if (search) {
+      const regex = new RegExp(escapeRegex(search), "i");
+      pipeline.push({ $match: { $or: [
+        { "customer.name": regex }, { "customer.phone": regex },
+        { saleId: regex }, { saleNumber: regex },
+      ] } });
+    }
+    if (req.query.debtStatus === "unpaid") pipeline.push({ $match: { _confirmedPaid: { $lte: DEBT_TOLERANCE } } });
+    if (req.query.debtStatus === "partial") pipeline.push({ $match: { _confirmedPaid: { $gt: DEBT_TOLERANCE } } });
+    if (req.query.debtStatus === "overdue") pipeline.push({ $match: { "creditDetails.dueDate": { $lt: now } } });
+    const dueDate = {};
+    const dueFrom = req.query.dueFrom ? parsePaymentDate(req.query.dueFrom) : null;
+    const dueTo = req.query.dueTo ? parsePaymentDate(req.query.dueTo) : null;
+    if ((req.query.dueFrom && !dueFrom) || (req.query.dueTo && !dueTo)) {
+      return res.status(400).json({ error: "Période d'échéance invalide" });
+    }
+    if (dueFrom) dueDate.$gte = new Date(`${dueFrom.calendarDate}T00:00:00+02:00`);
+    if (dueTo) dueDate.$lte = new Date(`${dueTo.calendarDate}T23:59:59.999+02:00`);
+    if (Object.keys(dueDate).length) pipeline.push({ $match: { "creditDetails.dueDate": dueDate } });
+
+    pipeline.push({ $sort: { "creditDetails.dueDate": 1, createdAt: 1, _id: 1 } });
+    pipeline.push({ $facet: {
+      data: [{ $skip: skip }, { $limit: limit }, { $unset: ["_confirmedPaid", "_pendingPaid", "_outstanding", "__v"] }],
+      summary: [{ $group: {
+        _id: null,
+        totalDebtInvoices: { $sum: 1 },
+        totalCreditInvoiced: { $sum: "$total" },
+        totalConfirmedPaid: { $sum: "$_confirmedPaid" },
+        totalOutstanding: { $sum: "$_outstanding" },
+        totalPendingPayments: { $sum: "$_pendingPaid" },
+        fullyUnpaidCount: { $sum: { $cond: [{ $lte: ["$_confirmedPaid", DEBT_TOLERANCE] }, 1, 0] } },
+        partiallyPaidCount: { $sum: { $cond: [{ $gt: ["$_confirmedPaid", DEBT_TOLERANCE] }, 1, 0] } },
+        overdueCount: { $sum: { $cond: [{ $and: [{ $ne: ["$creditDetails.dueDate", null] }, { $lt: ["$creditDetails.dueDate", now] }] }, 1, 0] } },
+      } }],
+    } });
+    const [result = {}] = await Sale.aggregate(pipeline);
+    const summary = result.summary?.[0] || {
+      totalDebtInvoices: 0, totalCreditInvoiced: 0, totalConfirmedPaid: 0,
+      totalOutstanding: 0, totalPendingPayments: 0, fullyUnpaidCount: 0,
+      partiallyPaidCount: 0, overdueCount: 0,
+    };
 
     res.json({
       success: true,
-      data: sales,
-      summary: {
-        totalRecords: sales.length,
-        totalOutstanding: sales.reduce(
-          (sum, sale) => sum + Number(sale.creditDetails?.amountDue || 0),
-          0
-        ),
-      },
+      data: result.data || [],
+      pagination: paginationMeta(page, limit, summary.totalDebtInvoices),
+      summary,
     });
   } catch (error) {
     console.error("Error fetching unpaid credit sales:", error);
@@ -906,11 +985,6 @@ router.post("/", authMiddleware, async (req, res) => {
     const rateRecord = await ExchangeRate.getCurrentRate(req.branchId);
     const capturedRate = rateRecord ? rateRecord.rate : null;
 
-    // Create/update customer only when phone is provided
-    const customerId = customer?.phone
-      ? await updateCustomerData(customer, total, req.branchId)
-      : null;
-
     // Build credit details if this is a credit sale
     const isCreditSale = paymentType === "credit";
     let creditDetailsData = undefined;
@@ -937,6 +1011,10 @@ router.post("/", authMiddleware, async (req, res) => {
                 {
                   paymentId: randomUUID(),
                   amount: initialPaid,
+                  paymentDate: customCreatedAt
+                    ? parsePaymentDate(String(saleDate).slice(0, 10)).value
+                    : new Date(),
+                  recordedAt: new Date(),
                   date: new Date(),
                   method: normalizedPM,
                   recordedBy: req.user.username || req.user.name || "Unknown",
@@ -960,7 +1038,7 @@ router.post("/", authMiddleware, async (req, res) => {
         phone: customer?.phone || "",
         email: customer?.email || "",
       },
-      customerId: customerId,
+      customerId: null,
       items: enrichedItems,
       subtotal,
       total,
@@ -981,6 +1059,12 @@ router.post("/", authMiddleware, async (req, res) => {
     let savedSale;
     try {
       session.startTransaction();
+
+      // Customer statistics and the sale belong to one business transaction:
+      // neither may survive if stock validation or sale persistence fails.
+      if (customer?.phone) {
+        saleData.customerId = await updateCustomerData(customer, total, req.branchId, session);
+      }
 
       for (const it of enrichedItems) {
         const updated = await adjustBranchStock({
@@ -1636,8 +1720,12 @@ router.patch("/:id/pending", authMiddleware, async (req, res) => {
 /** Record and confirm received credit cash atomically. */
 router.patch("/:id/credit-payment", authMiddleware, async (req, res) => {
   try {
+    const paymentRoles = new Set(["superadmin", "admin", "inventory_manager", "cashier_supervisor"]);
+    if (!paymentRoles.has(req.user.role)) {
+      return res.status(403).json({ error: "Vous n'êtes pas autorisé à enregistrer un paiement" });
+    }
     const { id } = req.params;
-    const { amount, method, notes } = req.body;
+    const { amount, method, notes, paymentDate } = req.body;
     const paymentId = String(
       req.body.paymentId || req.get("Idempotency-Key") || ""
     ).trim();
@@ -1649,6 +1737,13 @@ router.patch("/:id/credit-payment", authMiddleware, async (req, res) => {
     }
     if (!paymentId || paymentId.length > 128) {
       return res.status(400).json({ error: "L'identifiant paymentId est requis" });
+    }
+    const parsedPaymentDate = parsePaymentDate(paymentDate);
+    if (!parsedPaymentDate) {
+      return res.status(400).json({ error: "La date du paiement est requise au format AAAA-MM-JJ" });
+    }
+    if (parsedPaymentDate.calendarDate > calendarDateInAccountingZone()) {
+      return res.status(400).json({ error: "La date du paiement ne peut pas être dans le futur" });
     }
     if (!mongoose.isObjectIdOrHexString(id)) {
       return res.status(400).json({ error: "Identifiant de vente invalide" });
@@ -1676,7 +1771,8 @@ router.patch("/:id/credit-payment", authMiddleware, async (req, res) => {
       if (
         Math.abs(Number(existingPayment.amount) - paymentAmount) > 0.001 ||
         existingPayment.method !== normalizedMethod ||
-        String(existingPayment.notes || "") !== String(notes || "")
+        String(existingPayment.notes || "") !== String(notes || "") ||
+        calendarDateInAccountingZone(existingPayment.paymentDate || existingPayment.confirmedAt || existingPayment.date) !== parsedPaymentDate.calendarDate
       ) {
         return res.status(409).json({
           error: "Ce paymentId est déjà utilisé avec des données différentes",
@@ -1691,20 +1787,16 @@ router.patch("/:id/credit-payment", authMiddleware, async (req, res) => {
       });
     }
 
-    const currentDue = Math.max(
-      0,
-      Number(currentSale.creditDetails?.amountDue ?? currentSale.total)
-    );
+    const confirmedBefore = confirmedAmount(currentSale.creditDetails);
+    const pendingBefore = normalizeCreditSaleDocument(currentSale).creditDetails.pendingAmount;
+    const currentDue = Math.max(0, Math.round((Number(currentSale.total) - confirmedBefore) * 100) / 100);
     if (paymentAmount > currentDue + 0.001) {
       return res.status(409).json({
         error: `Le paiement dépasse le solde disponible (${currentDue.toFixed(2)} USD)`,
       });
     }
 
-    const currentPaid = Math.max(
-      0,
-      Number(currentSale.creditDetails?.amountPaid || 0)
-    );
+    const currentPaid = Math.max(0, Math.round(confirmedBefore * 100) / 100);
     const remainingDue = Math.max(0, Math.round((currentDue - paymentAmount) * 100) / 100);
     const updatedSale = await Sale.findOneAndUpdate(
       {
@@ -1712,22 +1804,21 @@ router.patch("/:id/credit-payment", authMiddleware, async (req, res) => {
         paymentType: "credit",
         status: VALID_REVENUE_STATUS_FILTER,
         "creditDetails.payments.paymentId": { $ne: paymentId },
-        // Optimistic concurrency guard: only update the balance we just read.
-        // This keeps simultaneous payments from overwriting each other while
-        // avoiding an aggregation-pipeline update, which is less portable
-        // across the MongoDB/Mongoose versions used by deployments.
-        "creditDetails.amountDue": currentSale.creditDetails?.amountDue ?? null,
-        "creditDetails.amountPaid": currentSale.creditDetails?.amountPaid ?? null,
+        // Any competing financial update changes updatedAt, so only one writer
+        // can apply counters calculated from this snapshot.
+        updatedAt: currentSale.updatedAt,
       },
       {
         $set: {
           "creditDetails.amountPaid": Math.round((currentPaid + paymentAmount) * 100) / 100,
           "creditDetails.amountDue": remainingDue,
+          "creditDetails.pendingAmount": pendingBefore,
           "creditDetails.fullyPaid": remainingDue <= 0.009,
         },
         $push: {
           "creditDetails.payments": {
-            paymentId, amount: paymentAmount, date: confirmedAt, method: normalizedMethod,
+            paymentId, amount: paymentAmount, paymentDate: parsedPaymentDate.value,
+            recordedAt: confirmedAt, date: confirmedAt, method: normalizedMethod,
             recordedBy: confirmedBy, notes: notes || "", status: "confirmed",
             confirmedAt, confirmedBy,
           },
@@ -1753,7 +1844,8 @@ router.patch("/:id/credit-payment", authMiddleware, async (req, res) => {
         if (
           Math.abs(Number(existing.amount) - paymentAmount) > 0.001 ||
           existing.method !== normalizedMethod ||
-          String(existing.notes || "") !== String(notes || "")
+          String(existing.notes || "") !== String(notes || "") ||
+          calendarDateInAccountingZone(existing.paymentDate || existing.confirmedAt || existing.date) !== parsedPaymentDate.calendarDate
         ) {
           return res.status(409).json({
             error: "Ce paymentId est déjà utilisé avec des données différentes",
@@ -1768,7 +1860,7 @@ router.patch("/:id/credit-payment", authMiddleware, async (req, res) => {
         });
       }
 
-      const available = Math.max(0, Number(sale.creditDetails?.amountDue ?? sale.total));
+      const available = normalizeCreditSaleDocument(sale).creditDetails.amountDue;
       return res.status(409).json({
         error: `Le paiement dépasse le solde disponible (${available.toFixed(2)} USD)`,
       });
@@ -1802,7 +1894,7 @@ router.patch(
       // included; branch authority still comes exclusively from authMiddleware
       // and every read/update below remains scoped to req.branchId.
       const confirmationRoles = new Set([
-        "superadmin", "admin", "manager", "inventory_manager", "cashier_supervisor", "staff",
+        "superadmin", "admin", "inventory_manager", "cashier_supervisor",
       ]);
       if (!confirmationRoles.has(req.user.role)) {
         return res.status(403).json({ error: "Vous n'êtes pas autorisé à confirmer ce paiement" });
@@ -1828,6 +1920,13 @@ router.patch(
       }
 
       const paymentAmount = Number(payment.amount);
+      const normalizedBeforeConfirmation = normalizeCreditSaleDocument(sale);
+      const confirmedBefore = normalizedBeforeConfirmation.creditDetails.amountPaid;
+      const pendingBefore = normalizedBeforeConfirmation.creditDetails.pendingAmount;
+      const remainingAfter = Math.max(0, Math.round((Number(sale.total) - confirmedBefore - paymentAmount) * 100) / 100);
+      if (!Number.isFinite(paymentAmount) || paymentAmount <= 0 || paymentAmount > normalizedBeforeConfirmation.creditDetails.amountDue + 0.001) {
+        return res.status(409).json({ error: "Le paiement en attente dépasse le solde disponible" });
+      }
       const confirmedAt = new Date();
       const confirmedBy = req.user.username || req.user.id;
       const updatedSale = await Sale.findOneAndUpdate(
@@ -1835,7 +1934,7 @@ router.patch(
           ...scopedFilter({ _id: id }, req.branchId),
           paymentType: "credit",
           status: VALID_REVENUE_STATUS_FILTER,
-          "creditDetails.amountDue": { $gte: paymentAmount },
+          updatedAt: sale.updatedAt,
           "creditDetails.payments": {
             $elemMatch: { paymentId, status: "pending", amount: paymentAmount },
           },
@@ -1843,31 +1942,10 @@ router.patch(
         [
           {
             $set: {
-              "creditDetails.amountPaid": {
-                $add: [{ $ifNull: ["$creditDetails.amountPaid", 0] }, paymentAmount],
-              },
-              "creditDetails.amountDue": {
-                $max: [
-                  0,
-                  {
-                    $subtract: [
-                      { $ifNull: ["$creditDetails.amountDue", "$total"] },
-                      paymentAmount,
-                    ],
-                  },
-                ],
-              },
-              "creditDetails.pendingAmount": {
-                $max: [
-                  0,
-                  {
-                    $subtract: [
-                      { $ifNull: ["$creditDetails.pendingAmount", paymentAmount] },
-                      paymentAmount,
-                    ],
-                  },
-                ],
-              },
+              "creditDetails.amountPaid": Math.round((confirmedBefore + paymentAmount) * 100) / 100,
+              "creditDetails.amountDue": remainingAfter,
+              "creditDetails.pendingAmount": Math.max(0, Math.round((pendingBefore - paymentAmount) * 100) / 100),
+              updatedAt: confirmedAt,
               "creditDetails.payments": {
                 $map: {
                   input: "$creditDetails.payments",
@@ -1904,7 +1982,7 @@ router.patch(
         const currentPayment = currentSale?.creditDetails?.payments?.find(
           (candidate) => candidate.paymentId === paymentId
         );
-        if (!currentPayment?.status || currentPayment.status === "confirmed") {
+        if (currentPayment && (!currentPayment.status || currentPayment.status === "confirmed")) {
           return res.json({
             success: true,
             idempotent: true,

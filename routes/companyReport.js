@@ -41,7 +41,8 @@ async function computeAllDailyBalances(branchId) {
     ]),
 
     // Credit invoices are receivables. Only an explicitly confirmed payment
-    // enters cash revenue, on its confirmation date (not the invoice date).
+    // enters cash revenue on its explicit accounting date. Legacy payments
+    // fall back to the former confirmedAt/date semantics.
     Sale.aggregate([
       {
         $match: scopedFilter({
@@ -66,8 +67,8 @@ async function computeAllDailyBalances(branchId) {
               format: "%Y-%m-%d",
               date: {
                 $ifNull: [
-                  "$creditDetails.payments.confirmedAt",
-                  "$creditDetails.payments.date",
+                  "$creditDetails.payments.paymentDate",
+                  { $ifNull: ["$creditDetails.payments.confirmedAt", "$creditDetails.payments.date"] },
                 ],
               },
               timezone: TZ,
@@ -162,8 +163,8 @@ async function computeAllDailyBalances(branchId) {
 // history pages remain the place for individual records.
 router.get("/summary", authMiddleware, async (req, res) => {
   try {
-    const start = req.query.from ? new Date(`${req.query.from}T00:00:00`) : new Date(0);
-    const end = req.query.to ? new Date(`${req.query.to}T23:59:59.999`) : new Date();
+    const start = req.query.from ? new Date(`${req.query.from}T00:00:00+02:00`) : new Date(0);
+    const end = req.query.to ? new Date(`${req.query.to}T23:59:59.999+02:00`) : new Date();
     if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || start > end) {
       return res.status(400).json({ error: "Invalid report period" });
     }
@@ -171,12 +172,20 @@ router.get("/summary", authMiddleware, async (req, res) => {
     const validSales = { status: { $nin: ["voided", "corrected", "cancelled", "refunded"] }, type: { $ne: "expense" } };
     const [cashSales, creditInvoices, creditReceipts, entries, expenses, transfers, inventory, customerCount, rate] = await Promise.all([
       Sale.aggregate([{ $match: scopedFilter({ ...validSales, paymentType: { $ne: "credit" }, ...period }, req.branchId) }, { $group: { _id: null, amount: { $sum: "$total" }, count: { $sum: 1 } } }]),
-      Sale.aggregate([{ $match: scopedFilter({ ...validSales, paymentType: "credit", ...period }, req.branchId) }, { $group: { _id: null, count: { $sum: 1 }, invoiced: { $sum: "$total" }, paid: { $sum: { $ifNull: ["$creditDetails.amountPaid", 0] } }, due: { $sum: { $ifNull: ["$creditDetails.amountDue", "$total"] } }, pending: { $sum: { $ifNull: ["$creditDetails.pendingAmount", 0] } }, fullyPaid: { $sum: { $cond: ["$creditDetails.fullyPaid", 1, 0] } } } }]),
+      Sale.aggregate([
+        { $match: scopedFilter({ ...validSales, paymentType: "credit", ...period }, req.branchId) },
+        { $set: {
+          confirmedPaid: { $cond: [{ $gt: [{ $size: { $ifNull: ["$creditDetails.payments", []] } }, 0] }, { $sum: { $map: { input: "$creditDetails.payments", as: "payment", in: { $cond: [{ $in: [{ $ifNull: ["$$payment.status", "confirmed"] }, ["confirmed"]] }, { $ifNull: ["$$payment.amount", 0] }, 0] } } } }, { $ifNull: ["$creditDetails.amountPaid", 0] }] },
+          pendingPaid: { $cond: [{ $gt: [{ $size: { $ifNull: ["$creditDetails.payments", []] } }, 0] }, { $sum: { $map: { input: "$creditDetails.payments", as: "payment", in: { $cond: [{ $eq: ["$$payment.status", "pending"] }, { $ifNull: ["$$payment.amount", 0] }, 0] } } } }, { $ifNull: ["$creditDetails.pendingAmount", 0] }] },
+        } },
+        { $set: { outstanding: { $max: [0, { $subtract: ["$total", "$confirmedPaid"] }] } } },
+        { $group: { _id: null, count: { $sum: 1 }, invoiced: { $sum: "$total" }, paid: { $sum: "$confirmedPaid" }, due: { $sum: "$outstanding" }, pending: { $sum: "$pendingPaid" }, fullyPaid: { $sum: { $cond: [{ $lte: ["$outstanding", 0.009] }, 1, 0] } } } },
+      ]),
       Sale.aggregate([
         { $match: scopedFilter({ ...validSales, paymentType: "credit" }, req.branchId) },
         { $unwind: "$creditDetails.payments" },
         { $match: { $or: [{ "creditDetails.payments.status": "confirmed" }, { "creditDetails.payments.status": { $exists: false } }] } },
-        { $addFields: { receiptDate: { $ifNull: ["$creditDetails.payments.confirmedAt", "$creditDetails.payments.date"] } } },
+        { $addFields: { receiptDate: { $ifNull: ["$creditDetails.payments.paymentDate", { $ifNull: ["$creditDetails.payments.confirmedAt", "$creditDetails.payments.date"] }] } } },
         { $match: { receiptDate: { $gte: start, $lte: end } } },
         { $group: { _id: null, amount: { $sum: "$creditDetails.payments.amount" }, count: { $sum: 1 } } },
       ]),

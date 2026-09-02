@@ -227,6 +227,10 @@ const saleSchema = new mongoose.Schema(
             default: () => randomUUID(),
           },
           amount: { type: Number, required: true, min: 0.01 },
+          // Business/accounting date selected by the user. `date` and
+          // `recordedAt` retain the real system-recording timestamp.
+          paymentDate: { type: Date, default: null },
+          recordedAt: { type: Date, default: Date.now },
           date: { type: Date, default: Date.now },
           method: {
             type: String,
@@ -308,6 +312,7 @@ saleSchema.index({ createdAt: -1 });
 saleSchema.index({ paymentType: 1 });
 saleSchema.index({ "creditDetails.fullyPaid": 1 });
 saleSchema.index({ "creditDetails.payments.confirmedAt": 1 });
+saleSchema.index({ branchId: 1, "creditDetails.payments.paymentDate": 1 });
 saleSchema.index({ "customer.phone": 1 }); // Keep this explicit index
 // REMOVED: saleSchema.index({ saleId: 1 }); ← DUPLICATE of unique: true on saleId
 saleSchema.index({ salesPerson: 1 });

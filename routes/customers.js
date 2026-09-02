@@ -4,6 +4,7 @@ const Customer = require("../models/Customer");
 const Sale = require("../models/Sale");
 const authMiddleware = require("../middleware/auth");
 const { scopedFilter } = require("../utils/branchContext");
+const { normalizeCreditSaleDocument } = require("../utils/creditAccounting");
 
 function customerScope(branchId) {
   return branchId === "butembo"
@@ -71,35 +72,49 @@ router.get("/fiche", async (req, res) => {
         { customerId: customer._id },
         { "customer.phone": phone.trim() },
       ],
-      status: { $nin: ["voided", "corrected"] },
+      status: { $nin: ["voided", "corrected", "refunded", "cancelled"] },
     }, req.branchId))
       .sort({ createdAt: -1 })
       .lean();
 
-    // Aggregate credit summary
-    const creditSales = sales.filter((s) => s.paymentType === "credit");
-    const totalCreditTaken = creditSales.reduce((sum, s) => sum + (s.total || 0), 0);
-    const totalCreditPaid = creditSales.reduce(
-      (sum, s) => sum + (s.creditDetails?.amountPaid || 0),
-      0
-    );
-    const totalCreditDue = creditSales.reduce(
-      (sum, s) => sum + (s.creditDetails?.amountDue || 0),
-      0
-    );
-    const unpaidCredits = creditSales.filter((s) => !s.creditDetails?.fullyPaid);
+    // Derive debt totals from immutable confirmed payment events, rather than
+    // trusting denormalized counters or reducing a frontend-sized page.
+    const [creditSummary = {}] = await Sale.aggregate([
+      { $match: scopedFilter({
+        $or: [{ customerId: customer._id }, { "customer.phone": phone.trim() }],
+        paymentType: "credit",
+        status: { $nin: ["voided", "corrected", "refunded", "cancelled"] },
+        type: { $in: ["sale", "reservation"] },
+      }, req.branchId) },
+      { $set: { _payments: { $ifNull: ["$creditDetails.payments", []] } } },
+      { $set: { _confirmedPaid: { $round: [{ $cond: [
+        { $gt: [{ $size: "$_payments" }, 0] },
+        { $sum: { $map: { input: "$_payments", as: "payment", in: { $cond: [
+          { $in: [{ $ifNull: ["$$payment.status", "confirmed"] }, ["confirmed"]] },
+          { $ifNull: ["$$payment.amount", 0] }, 0,
+        ] } } } },
+        { $ifNull: ["$creditDetails.amountPaid", 0] },
+      ] }, 2] } } },
+      { $set: { _outstanding: { $max: [0, { $round: [{ $subtract: ["$total", "$_confirmedPaid"] }, 2] }] } } },
+      { $group: {
+        _id: null,
+        totalCreditSales: { $sum: 1 }, totalCreditTaken: { $sum: "$total" },
+        totalCreditPaid: { $sum: "$_confirmedPaid" }, totalCreditDue: { $sum: "$_outstanding" },
+        unpaidCreditsCount: { $sum: { $cond: [{ $gt: ["$_outstanding", 0.009] }, 1, 0] } },
+      } },
+    ]);
 
     res.json({
       customer: customerForBranch(customer, req.branchId),
-      sales,
+      sales: sales.map(normalizeCreditSaleDocument),
       summary: {
         totalSales: sales.length,
         totalSpent: sales.reduce((sum, s) => sum + (s.total || 0), 0),
-        totalCreditSales: creditSales.length,
-        totalCreditTaken,
-        totalCreditPaid,
-        totalCreditDue,
-        unpaidCreditsCount: unpaidCredits.length,
+        totalCreditSales: creditSummary.totalCreditSales || 0,
+        totalCreditTaken: creditSummary.totalCreditTaken || 0,
+        totalCreditPaid: creditSummary.totalCreditPaid || 0,
+        totalCreditDue: creditSummary.totalCreditDue || 0,
+        unpaidCreditsCount: creditSummary.unpaidCreditsCount || 0,
       },
     });
   } catch (error) {
