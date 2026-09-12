@@ -175,18 +175,29 @@ async function computeAllDailyBalances(branchId) {
   return { allDays, currentBalance: runningBalance };
 }
 
+// Mirrors customers.js's local customerScope() — legacy customers without a
+// `branches` array predate the branch-ownership migration and are treated as
+// Butembo, same convention as every other branch-scoped collection.
+function customerBranchMatch(branchId) {
+  return branchId === "butembo"
+    ? { $or: [{ branches: "butembo" }, { branches: { $exists: false } }, { branches: null } ] }
+    : { branches: branchId };
+}
+
 // Report-oriented, non-paginated summary. MongoDB returns only aggregates;
 // history pages remain the place for individual records.
-router.get("/summary", authMiddleware, async (req, res) => {
+router.get("/summary", authMiddleware, requireReportAccess, async (req, res) => {
   try {
-    const start = req.query.from ? new Date(`${req.query.from}T00:00:00+02:00`) : new Date(0);
-    const end = req.query.to ? new Date(`${req.query.to}T23:59:59.999+02:00`) : new Date();
-    if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || start > end) {
-      return res.status(400).json({ error: "Invalid report period" });
+    let range;
+    try {
+      range = getGmt2ReportRange({ from: req.query.from, to: req.query.to });
+    } catch (rangeError) {
+      return res.status(400).json({ error: rangeError.message });
     }
-    const period = { createdAt: { $gte: start, $lte: end } };
+    const { start, end } = range; // end is EXCLUSIVE — see utils/dateRange.js
+    const period = { createdAt: { $gte: start, $lt: end } };
     const validSales = { status: { $nin: ["voided", "corrected", "cancelled", "refunded"] }, type: { $ne: "expense" } };
-    const [cashSales, creditInvoices, creditReceipts, entries, expenses, transfers, inventory, customerCount, rate] = await Promise.all([
+    const [cashSales, creditInvoices, creditReceipts, entries, expenses, transferFacets, inventory, customerStatsAgg, rate] = await Promise.all([
       Sale.aggregate([{ $match: scopedFilter({ ...validSales, paymentType: { $ne: "credit" }, ...period }, req.branchId) }, { $group: { _id: null, amount: { $sum: "$total" }, count: { $sum: 1 } } }]),
       Sale.aggregate([
         { $match: scopedFilter({ ...validSales, paymentType: "credit", ...period }, req.branchId) },
@@ -202,14 +213,71 @@ router.get("/summary", authMiddleware, async (req, res) => {
         { $unwind: "$creditDetails.payments" },
         { $match: { $or: [{ "creditDetails.payments.status": "confirmed" }, { "creditDetails.payments.status": { $exists: false } }] } },
         { $addFields: { receiptDate: { $ifNull: ["$creditDetails.payments.paymentDate", { $ifNull: ["$creditDetails.payments.confirmedAt", "$creditDetails.payments.date"] }] } } },
-        { $match: { receiptDate: { $gte: start, $lte: end } } },
+        { $match: { receiptDate: { $gte: start, $lt: end } } },
         { $group: { _id: null, amount: { $sum: "$creditDetails.payments.amount" }, count: { $sum: 1 } } },
       ]),
       Entry.aggregate([{ $match: scopedFilter({ status: "active", ...period }, req.branchId) }, { $group: { _id: null, amount: { $sum: "$amount" }, count: { $sum: 1 } } }]),
       Expense.aggregate([{ $match: scopedFilter({ status: "validated", ...period }, req.branchId) }, { $group: { _id: null, amount: { $sum: "$amount" }, count: { $sum: 1 } } }]),
-      Transfer.aggregate([{ $match: scopedFilter(period, req.branchId) }, { $group: { _id: "$status", count: { $sum: 1 }, cartons: { $sum: "$product.cartonQuantity" }, loosePieces: { $sum: "$product.looseQuantity" } } }]),
-      Product.aggregate([{ $match: scopedFilter({}, req.branchId) }, { $group: { _id: null, count: { $sum: 1 }, lowStock: { $sum: { $cond: [{ $lte: ["$stock", "$minStock"] }, 1, 0] } }, totalPieces: { $sum: "$stock" } } }]),
-      Customer.countDocuments({ $or: [{ branches: req.branchId }, ...(req.branchId === "butembo" ? [{ branches: { $exists: false } }, { branches: null }] : [])] }),
+      // $facet: per-status counts (unchanged) alongside a per-product carton/piece
+      // breakdown for the "Informations sur les transferts" table — that table
+      // previously read the raw (now paginated) GET /api/transfers list, which
+      // would have silently truncated to page 1 for a busy period.
+      Transfer.aggregate([
+        { $match: scopedFilter(period, req.branchId) },
+        {
+          $facet: {
+            byStatus: [{ $group: { _id: "$status", count: { $sum: 1 }, cartons: { $sum: "$product.cartonQuantity" }, loosePieces: { $sum: "$product.looseQuantity" } } }],
+            byProduct: [
+              { $match: { status: { $ne: "cancelled" } } },
+              { $group: { _id: { $ifNull: ["$product.productId", "$product.name"] }, name: { $last: "$product.name" }, cartonQuantity: { $sum: "$product.cartonQuantity" }, looseQuantity: { $sum: "$product.looseQuantity" } } },
+              { $sort: { cartonQuantity: -1 } },
+              { $limit: 100 },
+            ],
+          },
+        },
+      ]),
+      Product.aggregate([{ $match: scopedFilter({}, req.branchId) }, { $group: { _id: null, count: { $sum: 1 }, activeCount: { $sum: { $cond: [{ $ne: ["$status", "inactive"] }, 1, 0] } }, lowStock: { $sum: { $cond: [{ $lte: ["$stock", "$minStock"] }, 1, 0] } }, totalPieces: { $sum: "$stock" } } }]),
+      // Branch-scoped purchase stats without loading the customer collection
+      // into Node — mirrors customers.js's customerForBranch() field-selection
+      // logic (branchStats.<branchId>, falling back to the legacy top-level
+      // totalPurchases/totalSpent for Butembo-only pre-migration customers).
+      Customer.aggregate([
+        { $match: customerBranchMatch(req.branchId) },
+        {
+          // req.branchId is server-normalized to the literal "butembo"/"beni"
+          // (see utils/branchContext.js), so this interpolated dot-path is a
+          // safe, version-portable alternative to $getField.
+          $addFields: {
+            _branchStat: { $ifNull: [`$branchStats.${req.branchId}`, null] },
+          },
+        },
+        {
+          $addFields: {
+            _totalPurchases: {
+              $cond: [
+                { $ne: ["$_branchStat", null] },
+                "$_branchStat.totalPurchases",
+                req.branchId === "butembo" ? { $ifNull: ["$totalPurchases", 0] } : 0,
+              ],
+            },
+            _totalSpent: {
+              $cond: [
+                { $ne: ["$_branchStat", null] },
+                "$_branchStat.totalSpent",
+                req.branchId === "butembo" ? { $ifNull: ["$totalSpent", 0] } : 0,
+              ],
+            },
+          },
+        },
+        {
+          $group: {
+            _id: null,
+            totalCustomers: { $sum: 1 },
+            customersWithPurchases: { $sum: { $cond: [{ $gt: ["$_totalPurchases", 0] }, 1, 0] } },
+            totalSpentSum: { $sum: "$_totalSpent" },
+          },
+        },
+      ]),
       ExchangeRate.getCurrentRate(req.branchId),
     ]);
     const cash = cashSales[0] || {};
@@ -218,7 +286,10 @@ router.get("/summary", authMiddleware, async (req, res) => {
     const entry = entries[0] || {};
     const expense = expenses[0] || {};
     const stock = inventory[0] || {};
-    const transferSummary = Object.fromEntries(transfers.map((item) => [item._id, item]));
+    const customerStats = customerStatsAgg[0] || { totalCustomers: 0, customersWithPurchases: 0, totalSpentSum: 0 };
+    const transferFacetResult = transferFacets[0] || { byStatus: [], byProduct: [] };
+    const transferStatusList = transferFacetResult.byStatus || [];
+    const transferByStatus = Object.fromEntries(transferStatusList.map((item) => [item._id, item]));
     const revenue = Number(cash.amount || 0) + Number(receipts.amount || 0);
     res.json({
       success: true,
@@ -227,9 +298,14 @@ router.get("/summary", authMiddleware, async (req, res) => {
       salesSummary: { revenue, cashSalesRevenue: cash.amount || 0, confirmedCreditPayments: receipts.amount || 0, salesCount: Number(cash.count || 0) + Number(credit.count || 0), creditSalesCount: credit.count || 0, creditTotal: credit.invoiced || 0, creditCollected: credit.paid || 0, creditOutstanding: credit.due || 0, creditPending: credit.pending || 0, creditFullyPaid: credit.fullyPaid || 0 },
       entriesSummary: { active: { amount: entry.amount || 0, count: entry.count || 0 } },
       expensesSummary: { validated: { amount: expense.amount || 0, count: expense.count || 0 } },
-      transfersSummary: { total: transfers.reduce((sum, item) => sum + item.count, 0), pending: transferSummary.pending?.count || 0, inTransit: transferSummary.in_transit?.count || 0, delivered: transferSummary.delivered?.count || 0, cancelled: transferSummary.cancelled?.count || 0, cartons: transfers.reduce((sum, item) => sum + Number(item.cartons || 0), 0), loosePieces: transfers.reduce((sum, item) => sum + Number(item.loosePieces || 0), 0) },
-      inventorySummary: { productsCount: stock.count || 0, lowStock: stock.lowStock || 0, totalPieces: stock.totalPieces || 0 },
-      customersStats: { totalCustomers: customerCount },
+      transfersSummary: { total: transferStatusList.reduce((sum, item) => sum + item.count, 0), pending: transferByStatus.pending?.count || 0, inTransit: transferByStatus.in_transit?.count || 0, delivered: transferByStatus.delivered?.count || 0, cancelled: transferByStatus.cancelled?.count || 0, cartons: transferStatusList.reduce((sum, item) => sum + Number(item.cartons || 0), 0), loosePieces: transferStatusList.reduce((sum, item) => sum + Number(item.loosePieces || 0), 0) },
+      transfersByProduct: (transferFacetResult.byProduct || []).map((item) => ({ name: item.name || "Article", cartonQuantity: item.cartonQuantity || 0, looseQuantity: item.looseQuantity || 0 })),
+      inventorySummary: { productsCount: stock.count || 0, activeCount: stock.activeCount || 0, lowStock: stock.lowStock || 0, totalPieces: stock.totalPieces || 0 },
+      customersStats: {
+        totalCustomers: customerStats.totalCustomers || 0,
+        customersWithPurchases: customerStats.customersWithPurchases || 0,
+        averageSpent: customerStats.totalCustomers ? (customerStats.totalSpentSum || 0) / customerStats.totalCustomers : 0,
+      },
       exchangeRate: rate ? { rate: rate.rate, effectiveFrom: rate.effectiveFrom } : null,
       netResult: revenue + Number(entry.amount || 0) - Number(expense.amount || 0),
     });
