@@ -9,10 +9,26 @@ const Customer = require("../models/Customer");
 const Transfer = require("../models/Transfer");
 const ExchangeRate = require("../models/ExchangeRate");
 const authMiddleware = require("../middleware/auth");
-const { scopedFilter, BRANCHES } = require("../utils/branchContext");
+const { scopedFilter, BRANCHES, isSuperAdmin } = require("../utils/branchContext");
+const { getGmt2ReportRange } = require("../utils/dateRange");
 
 // GMT+2 timezone offset used across the POS
 const TZ = "+02:00";
+
+// Company reports are a "manager"-level module (see client/src/config/access.ts
+// — roles: ["manager"], with admin/superadmin always implicitly included).
+// access.ts is a client-side convenience only; enforce the same rule here so a
+// direct API call from a cashier/inventory role is rejected server-side too.
+function canViewCompanyReport(user) {
+  return isSuperAdmin(user) || user?.role === "manager";
+}
+
+function requireReportAccess(req, res, next) {
+  if (!canViewCompanyReport(req.user)) {
+    return res.status(403).json({ message: "Accès refusé: rapport réservé aux gérants" });
+  }
+  next();
+}
 
 // Fetch and compute the full all-time daily rolling balance in one pass.
 // Returns every calendar day that has at least one transaction, in date order,
@@ -228,7 +244,7 @@ router.get("/summary", authMiddleware, async (req, res) => {
 // Returns the rolling balance chain for the requested display window.
 // The opening balance for the first day in the window already accounts for
 // every transaction that occurred before that date.
-router.get("/daily-balance", authMiddleware, async (req, res) => {
+router.get("/daily-balance", authMiddleware, requireReportAccess, async (req, res) => {
   try {
     const { from, to } = req.query;
 
@@ -289,6 +305,231 @@ router.get("/daily-balance", authMiddleware, async (req, res) => {
   } catch (error) {
     console.error("Error computing daily balance:", error);
     res.status(500).json({ error: "Failed to compute daily balance" });
+  }
+});
+
+// Sales/reservations count toward "sold quantity" the same way getReceivedRevenue
+// (routes/sales.js) treats them as legitimate business events: any status other
+// than voided/corrected/cancelled/refunded, restricted to real sale/reservation
+// documents (excludes the "expense" type, which never carries items anyway).
+// Stock is already deducted when a reservation is CREATED (see POST /api/sales),
+// so pending reservations correctly count here too — this mirrors what
+// CompanyReport.tsx's default (unfiltered) /api/sales fetch previously included.
+const TOP_PRODUCTS_STATUS_FILTER = { $nin: ["voided", "corrected", "cancelled", "refunded"] };
+const TOP_PRODUCTS_TYPE_FILTER = { $in: ["sale", "reservation"] };
+const DEFAULT_TOP_PRODUCTS_LIMIT = 50;
+const MAX_TOP_PRODUCTS_LIMIT = 200;
+
+// GET /api/company-report/top-products?[today|date|month/year|year|from&to]&limit=50
+//
+// Dedicated aggregation for "Meilleurs articles vendus" / "Produits en bonus".
+// Deliberately independent of /api/sales (which is a paginable history
+// endpoint) — this reads the full matched period directly from MongoDB so the
+// ranking is correct regardless of any pagination applied elsewhere, and
+// regardless of whether sibling report sections (customers, expenses, ...)
+// succeeded or failed to load on the client.
+router.get("/top-products", authMiddleware, requireReportAccess, async (req, res) => {
+  try {
+    let range;
+    try {
+      range = getGmt2ReportRange(req.query);
+    } catch (rangeError) {
+      return res.status(400).json({ error: rangeError.message });
+    }
+
+    const rawLimit = parseInt(req.query.limit, 10);
+    const limit = Number.isFinite(rawLimit) && rawLimit > 0
+      ? Math.min(rawLimit, MAX_TOP_PRODUCTS_LIMIT)
+      : DEFAULT_TOP_PRODUCTS_LIMIT;
+
+    const pipeline = [
+      {
+        $match: scopedFilter(
+          {
+            status: TOP_PRODUCTS_STATUS_FILTER,
+            type: TOP_PRODUCTS_TYPE_FILTER,
+            createdAt: { $gte: range.start, $lt: range.end },
+          },
+          req.branchId
+        ),
+      },
+      // Oldest-first so $last below picks the most recent name/piecesPerCarton
+      // snapshot for a product that was renamed or repackaged mid-period.
+      { $sort: { createdAt: 1 } },
+      { $unwind: "$items" },
+      {
+        $addFields: {
+          "items._piecesPerCarton": { $ifNull: ["$items.piecesPerCarton", 1] },
+          "items._bonusQuantity": { $ifNull: ["$items.bonusQuantity", 0] },
+        },
+      },
+      {
+        $addFields: {
+          // Legacy items saved before paidQuantity existed only stored a
+          // combined `quantity` (paid + bonus) — recover paid-only by
+          // subtracting the (already-defaulted) bonus quantity from it.
+          "items._paidQuantity": {
+            $ifNull: [
+              "$items.paidQuantity",
+              { $max: [0, { $subtract: [{ $ifNull: ["$items.quantity", 0] }, "$items._bonusQuantity"] }] },
+            ],
+          },
+          "items._hasPaidParts": {
+            $gt: [{ $add: [{ $ifNull: ["$items.cartonQuantity", 0] }, { $ifNull: ["$items.looseQuantity", 0] }] }, 0],
+          },
+          "items._hasBonusParts": {
+            $gt: [{ $add: [{ $ifNull: ["$items.bonusCartons", 0] }, { $ifNull: ["$items.bonusPieces", 0] }] }, 0],
+          },
+        },
+      },
+      {
+        $addFields: {
+          "items._soldCartons": {
+            $cond: [
+              "$items._hasPaidParts",
+              { $ifNull: ["$items.cartonQuantity", 0] },
+              { $floor: { $divide: ["$items._paidQuantity", "$items._piecesPerCarton"] } },
+            ],
+          },
+          "items._soldPieces": {
+            $cond: [
+              "$items._hasPaidParts",
+              { $ifNull: ["$items.looseQuantity", 0] },
+              { $mod: ["$items._paidQuantity", "$items._piecesPerCarton"] },
+            ],
+          },
+          "items._bonusCartons": {
+            $cond: [
+              "$items._hasBonusParts",
+              { $ifNull: ["$items.bonusCartons", 0] },
+              { $floor: { $divide: ["$items._bonusQuantity", "$items._piecesPerCarton"] } },
+            ],
+          },
+          "items._bonusPieces": {
+            $cond: [
+              "$items._hasBonusParts",
+              { $ifNull: ["$items.bonusPieces", 0] },
+              { $mod: ["$items._bonusQuantity", "$items._piecesPerCarton"] },
+            ],
+          },
+          // Credit invoices are receivables, not recognized cash — never
+          // attribute their invoice value to product "revenue" here (see the
+          // official financial equation; confirmed credit payments are
+          // tracked separately in /daily-balance, not per-product).
+          "items._revenue": {
+            $cond: [
+              { $eq: ["$paymentType", "credit"] },
+              0,
+              {
+                $ifNull: [
+                  "$items.total",
+                  {
+                    $multiply: [
+                      { $ifNull: ["$items.price", 0] },
+                      { $divide: ["$items._paidQuantity", "$items._piecesPerCarton"] },
+                    ],
+                  },
+                ],
+              },
+            ],
+          },
+        },
+      },
+      {
+        $group: {
+          _id: { $ifNull: ["$items.productId", { $concat: ["name:", { $ifNull: ["$items.name", "Article"] }] }] },
+          productId: { $last: "$items.productId" },
+          name: { $last: { $ifNull: ["$items.name", "Article"] } },
+          piecesPerCarton: { $last: "$items._piecesPerCarton" },
+          paidQuantity: { $sum: "$items._paidQuantity" },
+          bonusQuantity: { $sum: "$items._bonusQuantity" },
+          soldCartons: { $sum: "$items._soldCartons" },
+          soldPieces: { $sum: "$items._soldPieces" },
+          bonusCartons: { $sum: "$items._bonusCartons" },
+          bonusPieces: { $sum: "$items._bonusPieces" },
+          revenue: { $sum: "$items._revenue" },
+        },
+      },
+      // Historical safety: a deactivated/renamed product still resolves by
+      // _id, so its current stock is still shown; a product that no longer
+      // exists at all (never expected, but tolerated) just shows stock 0.
+      {
+        $lookup: {
+          from: "products",
+          localField: "productId",
+          foreignField: "_id",
+          as: "_product",
+        },
+      },
+      {
+        $addFields: {
+          remainingStock: { $ifNull: [{ $arrayElemAt: ["$_product.stock", 0] }, 0] },
+          productActive: { $ne: [{ $arrayElemAt: ["$_product.status", 0] }, "inactive"] },
+        },
+      },
+      {
+        $project: {
+          _id: 0,
+          productId: 1,
+          name: 1,
+          piecesPerCarton: 1,
+          paidQuantity: 1,
+          bonusQuantity: 1,
+          soldCartons: 1,
+          soldPieces: 1,
+          bonusCartons: 1,
+          bonusPieces: 1,
+          revenue: 1,
+          remainingStock: 1,
+          productActive: 1,
+        },
+      },
+      {
+        $facet: {
+          topByQuantity: [{ $sort: { paidQuantity: -1, name: 1 } }, { $limit: limit }],
+          topByBonus: [
+            { $match: { bonusQuantity: { $gt: 0 } } },
+            { $sort: { bonusQuantity: -1, name: 1 } },
+            { $limit: limit },
+          ],
+          totals: [
+            {
+              $group: {
+                _id: null,
+                distinctProducts: { $sum: 1 },
+                totalPaidQuantity: { $sum: "$paidQuantity" },
+                totalBonusQuantity: { $sum: "$bonusQuantity" },
+                totalRevenue: { $sum: "$revenue" },
+              },
+            },
+          ],
+        },
+      },
+    ];
+
+    const [result] = await Sale.aggregate(pipeline);
+    const totals = result.totals[0] || {
+      distinctProducts: 0,
+      totalPaidQuantity: 0,
+      totalBonusQuantity: 0,
+      totalRevenue: 0,
+    };
+
+    res.json({
+      success: true,
+      branch: BRANCHES.find((branch) => branch.id === req.branchId),
+      period: {
+        start: range.start.toISOString(),
+        end: range.end.toISOString(),
+        description: range.description,
+      },
+      topByQuantity: result.topByQuantity,
+      topByBonus: result.topByBonus,
+      totals,
+    });
+  } catch (error) {
+    console.error("Error computing top products:", error);
+    res.status(500).json({ error: "Failed to compute top products" });
   }
 });
 

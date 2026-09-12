@@ -309,6 +309,11 @@ const saleSchema = new mongoose.Schema(
 
 // Create index for better query performance
 saleSchema.index({ createdAt: -1 });
+// Every report/analytics query (routes/sales.js, routes/companyReport.js)
+// matches branchId + a createdAt range together — a compound index lets
+// MongoDB satisfy that in one index scan instead of intersecting the
+// separate branchId and createdAt indexes above.
+saleSchema.index({ branchId: 1, createdAt: -1 });
 saleSchema.index({ paymentType: 1 });
 saleSchema.index({ "creditDetails.fullyPaid": 1 });
 saleSchema.index({ "creditDetails.payments.confirmedAt": 1 });

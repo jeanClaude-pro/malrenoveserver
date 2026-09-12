@@ -22,6 +22,7 @@ const {
   scopedFilter,
   adjustBranchStock,
 } = require("../utils/branchContext");
+const { getGmt2ReportRange } = require("../utils/dateRange");
 
 // normalize to the Sale model enum
 function normalizePaymentMethod(pm) {
@@ -327,150 +328,35 @@ async function recalculateCustomerStats(customerId, branchId) {
 }
 
 // ==================== TIME FRAME HELPER FUNCTIONS ====================
-
-/**
- * Parse date string and set appropriate time boundaries
- * @param {string} dateStr - Date in YYYY-MM-DD format
- * @param {boolean} isEndDate - If true, sets to end of day (23:59:59.999)
- * @returns {Date} Parsed date object
- */
-function parseDate(dateStr, isEndDate = false) {
-  if (!dateStr) return null;
-  
-  const date = new Date(dateStr);
-  if (isNaN(date.getTime())) {
-    throw new Error(`Invalid date format: ${dateStr}. Use YYYY-MM-DD format.`);
-  }
-  
-  if (isEndDate) {
-    date.setHours(23, 59, 59, 999);
-  } else {
-    date.setHours(0, 0, 0, 0);
-  }
-  
-  return date;
-}
+//
+// Both helpers below delegate to utils/dateRange.js — the single authoritative
+// GMT+2 boundary calculator shared with the reporting endpoints (see
+// routes/companyReport.js). Previously this file computed boundaries with
+// `new Date(); date.setHours(0,0,0,0)`, which uses the Node process's own
+// timezone (UTC on Render) instead of the GMT+2 business timezone, silently
+// shifting "today"/day/month/year boundaries by up to 2 hours. The public
+// query-parameter contract (from/to/date/year/month, default today) and the
+// returned filter's `createdAt.$gte` field are unchanged; the upper bound is
+// now `$lt` (exclusive next-boundary instant) instead of an inclusive
+// `$lte` end-of-day instant — this is the boundary style utils/dateRange.js
+// uses everywhere and avoids millisecond-precision edge cases at day seams.
 
 /**
  * Build date range filter based on timeframe parameters
  * Follows priority: custom range > specific day > month > year > today
  * @param {Object} query - Request query parameters
- * @returns {Object} MongoDB date filter { createdAt: { $gte, $lte } }
+ * @returns {Object} MongoDB date filter { createdAt: { $gte, $lt } }
  */
 function buildTimeframeFilter(query) {
-  const { from, to, date, year, month } = query;
-  
-  // Priority 1: Custom date range (from and to)
-  if (from || to) {
-    const startDate = from ? parseDate(from, false) : new Date(0); // Beginning of time
-    const endDate = to ? parseDate(to, true) : new Date(); // Current date/time
-    
-    if (from && to && startDate > endDate) {
-      throw new Error("Start date (from) must be before or equal to end date (to)");
-    }
-    
-    return {
-      createdAt: {
-        $gte: startDate,
-        $lte: endDate
-      }
-    };
-  }
-  
-  // Priority 2: Specific day
-  if (date) {
-    const dayDate = parseDate(date, false);
-    const startDate = new Date(dayDate);
-    const endDate = new Date(dayDate);
-    endDate.setHours(23, 59, 59, 999);
-    
-    return {
-      createdAt: {
-        $gte: startDate,
-        $lte: endDate
-      }
-    };
-  }
-  
-  // Priority 3: Specific month
-  if (year && month) {
-    const yearNum = parseInt(year, 10);
-    const monthNum = parseInt(month, 10) - 1; // JS months are 0-indexed
-    
-    if (isNaN(yearNum) || yearNum < 2000 || yearNum > 2100) {
-      throw new Error(`Invalid year: ${year}. Must be between 2000-2100.`);
-    }
-    
-    if (isNaN(monthNum) || monthNum < 0 || monthNum > 11) {
-      throw new Error(`Invalid month: ${month}. Must be between 01-12.`);
-    }
-    
-    const startDate = new Date(yearNum, monthNum, 1);
-    const endDate = new Date(yearNum, monthNum + 1, 0); // Last day of month
-    endDate.setHours(23, 59, 59, 999);
-    
-    return {
-      createdAt: {
-        $gte: startDate,
-        $lte: endDate
-      }
-    };
-  }
-  
-  // Priority 4: Full year
-  if (year) {
-    const yearNum = parseInt(year, 10);
-    
-    if (isNaN(yearNum) || yearNum < 2000 || yearNum > 2100) {
-      throw new Error(`Invalid year: ${year}. Must be between 2000-2100.`);
-    }
-    
-    const startDate = new Date(yearNum, 0, 1); // Jan 1
-    const endDate = new Date(yearNum, 11, 31); // Dec 31
-    endDate.setHours(23, 59, 59, 999);
-    
-    return {
-      createdAt: {
-        $gte: startDate,
-        $lte: endDate
-      }
-    };
-  }
-  
-  // Priority 5: Default to today
-  const today = new Date();
-  const startDate = new Date(today);
-  startDate.setHours(0, 0, 0, 0);
-  const endDate = new Date(today);
-  endDate.setHours(23, 59, 59, 999);
-  
-  return {
-    createdAt: {
-      $gte: startDate,
-      $lte: endDate
-    }
-  };
+  const { start, end } = getGmt2ReportRange(query);
+  return { createdAt: { $gte: start, $lt: end } };
 }
 
 /**
  * Get human-readable timeframe description
  */
 function getTimeframeDescription(query) {
-  const { from, to, date, year, month } = query;
-  
-  if (from || to) {
-    return `Custom range: ${from || 'Beginning'} to ${to || 'Now'}`;
-  }
-  if (date) {
-    return `Day: ${date}`;
-  }
-  if (year && month) {
-    return `Month: ${year}-${String(month).padStart(2, '0')}`;
-  }
-  if (year) {
-    return `Year: ${year}`;
-  }
-  return 'Today (default)';
+  return getGmt2ReportRange(query).description;
 }
 
 // ==================== MAIN SALES ENDPOINT (TIME FRAME PAGINATION) ====================
@@ -584,7 +470,7 @@ router.get("/", authMiddleware, async (req, res) => {
       timeframe: {
         description: timeframeDescription,
         start: timeframeFilter.createdAt.$gte.toISOString(),
-        end: timeframeFilter.createdAt.$lte.toISOString(),
+        end: timeframeFilter.createdAt.$lt.toISOString(),
         query: {
           from: req.query.from || null,
           to: req.query.to || null,
@@ -717,16 +603,16 @@ router.get("/unpaid", authMiddleware, async (req, res) => {
 router.get("/stats/daily", authMiddleware, async (req, res) => {
   try {
     const { date } = req.query;
-    const targetDate = date ? new Date(date) : new Date();
-    const startOfDay = new Date(targetDate);
-    startOfDay.setHours(0, 0, 0, 0);
-    const endOfDay = new Date(targetDate);
-    endOfDay.setHours(23, 59, 59, 999);
+    // GMT+2 business-day boundaries (see utils/dateRange.js) — not the
+    // server process's own timezone.
+    const { start: startOfDay, end: endOfDay } = getGmt2ReportRange(
+      date ? { date } : {}
+    );
 
     const dailySales = await Sale.aggregate([
       {
         $match: scopedFilter({
-          createdAt: { $gte: startOfDay, $lte: endOfDay },
+          createdAt: { $gte: startOfDay, $lt: endOfDay },
           // ✅ FIXED: INCLUDE PENDING RESERVATIONS (money already received)
           status: { $in: ["completed", "pending"] },
           // ✅ FIXED: INCLUDE BOTH SALES AND RESERVATIONS
@@ -744,7 +630,7 @@ router.get("/stats/daily", authMiddleware, async (req, res) => {
 
     // Use timeframe-based query (no limit) for consistency
     const sales = await Sale.find(scopedFilter({
-      createdAt: { $gte: startOfDay, $lte: endOfDay },
+      createdAt: { $gte: startOfDay, $lt: endOfDay },
       status: { $in: ["completed", "pending"] },
       type: { $in: ["sale", "reservation"] }
     }, req.branchId))
@@ -754,11 +640,16 @@ router.get("/stats/daily", authMiddleware, async (req, res) => {
 
     const receivedRevenue = await getReceivedRevenue({
       $gte: startOfDay,
-      $lte: endOfDay,
+      $lt: endOfDay,
     }, {}, req.branchId);
 
+    // GMT+2 calendar date represented by this range, as YYYY-MM-DD.
+    const gmt2DateLabel = new Date(startOfDay.getTime() + 2 * 60 * 60 * 1000)
+      .toISOString()
+      .split("T")[0];
+
     res.json({
-      date: targetDate.toISOString().split("T")[0],
+      date: date || gmt2DateLabel,
       totalSales: dailySales[0]?.totalSales || 0,
       totalRevenue: receivedRevenue.amount,
       cashSalesRevenue: receivedRevenue.cashAmount,

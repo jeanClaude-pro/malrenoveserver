@@ -209,7 +209,7 @@ app.get("/health", (req, res) => {
 
 // API-only service — frontend is deployed separately (Netlify)
 app.get('/', (req, res) => {
-  res.json({ message: 'Dookon API is running', health: '/health' });
+  res.json({ message: 'Entre Nous Renove API is running', health: '/health' });
 });
 
 // 404 for unknown API routes
