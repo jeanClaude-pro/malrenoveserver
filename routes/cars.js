@@ -11,6 +11,7 @@ const {
   scopedFilter,
   adjustBranchStock,
 } = require("../utils/branchContext");
+const { toTotalPieces } = require("../utils/cartonQuantity");
 
 // Helper function to generate unique trip ID
 function generateTripId() {
@@ -555,11 +556,18 @@ router.patch("/:id/confirm-arrival", authMiddleware, async (req, res) => {
         !mongoose.Types.ObjectId.isValid(String(plannedProducts[0].productId || ""));
       if (isUnlinkedLegacyTrip) {
         const legacyReceipt = Array.isArray(receivedProducts) ? receivedProducts[0] || {} : {};
-        const boxes = Number(legacyReceipt.receivedBoxes ?? receivedBoxes ?? plannedProducts[0].boxesCount);
-        const pieces = Number(legacyReceipt.receivedPieces ?? receivedPieces ?? plannedProducts[0].piecesPerBox);
+        const usesCartonLooseFormat = legacyReceipt.receivedCartons !== undefined || legacyReceipt.receivedLoosePieces !== undefined;
+        const boxes = Number(usesCartonLooseFormat ? legacyReceipt.receivedCartons : legacyReceipt.receivedBoxes ?? receivedBoxes ?? plannedProducts[0].boxesCount);
+        const pieces = Number(usesCartonLooseFormat ? legacyReceipt.receivedLoosePieces : legacyReceipt.receivedPieces ?? receivedPieces ?? plannedProducts[0].piecesPerBox);
         if (!Number.isInteger(boxes) || boxes < 0 || !Number.isInteger(pieces) || pieces < 0) {
           throw httpError(400, "Les quantités reçues doivent être des entiers positifs ou nuls");
         }
+        if (usesCartonLooseFormat && pieces >= plannedProducts[0].piecesPerBox) {
+          throw httpError(400, "Les pièces restantes doivent être inférieures au nombre de pièces par carton");
+        }
+        const totalReceivedPieces = usesCartonLooseFormat
+          ? toTotalPieces(boxes, pieces, plannedProducts[0].piecesPerBox)
+          : boxes * pieces;
         const now = new Date();
         const arrivalDate = actualArrivalTime ? new Date(actualArrivalTime) : now;
         if (Number.isNaN(arrivalDate.getTime())) throw httpError(400, "Date d'arrivée invalide");
@@ -572,7 +580,7 @@ router.patch("/:id/confirm-arrival", authMiddleware, async (req, res) => {
           confirmedBy,
           receivedBoxes: boxes,
           receivedPieces: pieces,
-          totalReceivedPieces: boxes * pieces,
+          totalReceivedPieces,
           notes: (notes || "").trim(),
         };
         trip.lastModifiedBy = req.user.id;
@@ -597,12 +605,7 @@ router.patch("/:id/confirm-arrival", authMiddleware, async (req, res) => {
           if (!mongoose.Types.ObjectId.isValid(productId) || receivedByProduct.has(productId)) {
             throw httpError(400, `Produit reçu invalide à la ligne ${index + 1}`);
           }
-          const boxes = Number(received.receivedBoxes ?? received.boxesCount);
-          const pieces = Number(received.receivedPieces ?? received.piecesPerBox);
-          if (!Number.isInteger(boxes) || boxes < 0 || !Number.isInteger(pieces) || pieces < 0) {
-            throw httpError(400, "Les quantités reçues doivent être des entiers positifs ou nuls");
-          }
-          receivedByProduct.set(productId, { boxes, pieces });
+          receivedByProduct.set(productId, received);
         }
       }
 
@@ -611,24 +614,41 @@ router.patch("/:id/confirm-arrival", authMiddleware, async (req, res) => {
         if (!mongoose.Types.ObjectId.isValid(productId)) {
           throw httpError(409, `Le trajet contient un ancien produit non lié à l'inventaire: ${planned.productName}`);
         }
-        let receipt = receivedByProduct.get(productId);
+        const rawReceipt = receivedByProduct.get(productId);
+        let receipt;
+        if (rawReceipt) {
+          const usesCartonLooseFormat = rawReceipt.receivedCartons !== undefined || rawReceipt.receivedLoosePieces !== undefined;
+          const boxes = Number(usesCartonLooseFormat ? rawReceipt.receivedCartons : rawReceipt.receivedBoxes ?? rawReceipt.boxesCount);
+          const pieces = Number(usesCartonLooseFormat ? rawReceipt.receivedLoosePieces : rawReceipt.receivedPieces ?? rawReceipt.piecesPerBox);
+          if (!Number.isInteger(boxes) || boxes < 0 || !Number.isInteger(pieces) || pieces < 0) {
+            throw httpError(400, "Les quantités reçues doivent être des entiers positifs ou nuls");
+          }
+          if (usesCartonLooseFormat && pieces >= planned.piecesPerBox) {
+            throw httpError(400, `Les pièces restantes pour ${planned.productName} doivent être inférieures à ${planned.piecesPerBox}`);
+          }
+          receipt = { boxes, pieces, usesCartonLooseFormat };
+        }
         if (!receipt && plannedProducts.length === 1 && !Array.isArray(receivedProducts)) {
           const boxes = Number(receivedBoxes);
           const pieces = Number(receivedPieces);
           if (!Number.isInteger(boxes) || boxes < 0 || !Number.isInteger(pieces) || pieces < 0) {
             throw httpError(400, "Les quantités reçues doivent être des entiers positifs ou nuls");
           }
-          receipt = { boxes, pieces };
+          receipt = { boxes, pieces, usesCartonLooseFormat: false };
         }
         if (!receipt && !Array.isArray(receivedProducts)) {
-          receipt = { boxes: planned.boxesCount, pieces: planned.piecesPerBox };
+          receipt = { boxes: planned.boxesCount, pieces: planned.piecesPerBox, usesCartonLooseFormat: false };
         }
         if (!receipt) throw httpError(400, `Quantité reçue manquante à la ligne ${index + 1}`);
         return {
           productId: planned.productId,
           productName: planned.productName,
-          quantity: receipt.boxes * receipt.pieces,
-          piecesPerCarton: receipt.pieces || planned.piecesPerBox || 1,
+          quantity: receipt.usesCartonLooseFormat
+            ? toTotalPieces(receipt.boxes, receipt.pieces, planned.piecesPerBox)
+            : receipt.boxes * receipt.pieces,
+          piecesPerCarton: receipt.usesCartonLooseFormat
+            ? planned.piecesPerBox
+            : receipt.pieces || planned.piecesPerBox || 1,
           receivedBoxes: receipt.boxes,
           receivedPieces: receipt.pieces,
         };
@@ -682,8 +702,8 @@ router.patch("/:id/confirm-arrival", authMiddleware, async (req, res) => {
       trip.arrivalDetails = {
         confirmedAt: now,
         confirmedBy,
-        receivedBoxes: inventoryItems.reduce((sum, item) => sum + item.receivedBoxes, 0),
-        receivedPieces: inventoryItems.length === 1 ? inventoryItems[0].receivedPieces : 0,
+        receivedBoxes: inventoryItems.reduce((sum, item) => sum + Math.floor(item.quantity / item.piecesPerCarton), 0),
+        receivedPieces: inventoryItems.reduce((sum, item) => sum + (item.quantity % item.piecesPerCarton), 0),
         totalReceivedPieces: totalReceived,
         products: positiveItems.map((item) => ({
           productId: item.productId,
