@@ -686,7 +686,7 @@ router.patch("/:id/validate", authMiddleware, async (req, res) => {
     const updatedNotes = expense.notes ? `${expense.notes}\n${validationNotes}` : validationNotes;
 
     const updatedExpense = await Expense.findOneAndUpdate(
-      scopedFilter({ _id: req.params.id }, req.branchId),
+      scopedFilter({ _id: req.params.id, status: "pending" }, req.branchId),
       {
         status: "validated",
         validatedBy: req.user?.username || req.user?.name || req.user?.id || "Admin",
@@ -696,6 +696,7 @@ router.patch("/:id/validate", authMiddleware, async (req, res) => {
       { new: true, runValidators: true }
     );
 
+    if (!updatedExpense) return res.status(409).json({ error: "Expense status changed. Refresh and try again." });
     res.json(updatedExpense);
   } catch (error) {
     console.error("Error validating expense:", error);
@@ -709,7 +710,7 @@ router.patch("/:id/validate", authMiddleware, async (req, res) => {
 /** ---------- REJECT EXPENSE ---------- **/
 router.patch("/:id/reject", authMiddleware, async (req, res) => {
   try {
-    const { reason, notes } = req.body;
+    const { reason } = req.body;
     
     // Check authorization
     if (req.user && !req.user.canValidate) {
@@ -733,21 +734,14 @@ router.patch("/:id/reject", authMiddleware, async (req, res) => {
       return res.status(400).json({ error: "Rejection reason is required" });
     }
 
-    const rejectionNotes = `Rejected: ${reason}${notes ? ` - ${notes}` : ''}`;
-    const updatedNotes = expense.notes ? `${expense.notes}\n${rejectionNotes}` : rejectionNotes;
-
-    const updatedExpense = await Expense.findOneAndUpdate(
-      scopedFilter({ _id: req.params.id }, req.branchId),
-      {
-        status: "rejected",
-        validatedBy: req.user?.username || req.user?.name || req.user?.id || "Admin",
-        validatedAt: new Date(),
-        notes: updatedNotes
-      },
-      { new: true, runValidators: true }
+    // Rejection permanently removes only a pending expense. The status guard
+    // prevents a competing confirmation from being deleted.
+    const deletedExpense = await Expense.findOneAndDelete(
+      scopedFilter({ _id: req.params.id, status: "pending" }, req.branchId)
     );
+    if (!deletedExpense) return res.status(409).json({ error: "Expense status changed. Refresh and try again." });
+    res.json({ success: true, deletedExpenseId: deletedExpense._id });
 
-    res.json(updatedExpense);
   } catch (error) {
     console.error("Error rejecting expense:", error);
     if (error.name === "CastError") {

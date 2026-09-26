@@ -784,7 +784,7 @@ router.patch("/:id/status", authMiddleware, async (req, res) => {
     
     // Update actual arrival time if status is arrived or completed
     let actualArrivalTime = trip.actualArrivalTime;
-    if (status === "arrived" || status === "completed") {
+    if ((status === "arrived" || status === "completed") && !actualArrivalTime) {
       actualArrivalTime = new Date();
       changes.set("actualArrivalTime", { from: trip.actualArrivalTime, to: actualArrivalTime });
     }
@@ -835,6 +835,7 @@ router.put("/:id", authMiddleware, async (req, res) => {
       products,
       departureTime,
       expectedArrivalTime,
+      actualArrivalTime,
       fuelCost,
       tollCost,
       otherCosts,
@@ -847,7 +848,24 @@ router.put("/:id", authMiddleware, async (req, res) => {
     await session.withTransaction(async () => {
       const trip = await CarTrip.findOne(scopedFilter({ _id: id }, req.branchId)).session(session);
       if (!trip) throw httpError(404, "Car trip not found");
+      const confirmed = trip.inventoryProcessed || ["arrived", "completed"].includes(trip.status);
+      if (confirmed && req.user.role !== "superadmin") {
+        throw httpError(403, "Seul le superadmin peut modifier un trajet confirmé");
+      }
+      if (confirmed && (typeof reason !== "string" || !reason.trim())) {
+        throw httpError(400, "Une raison de modification est requise");
+      }
       const changes = new Map();
+      if (actualArrivalTime !== undefined) {
+        if (req.user.role !== "superadmin") throw httpError(403, "Seul le superadmin peut modifier la date d'arrivée");
+        if (!confirmed) throw httpError(400, "Confirmez d'abord l'arrivée du trajet");
+        const date = actualArrivalTime ? new Date(actualArrivalTime) : null;
+        if (!date || Number.isNaN(date.getTime())) throw httpError(400, "Date d'arrivée invalide");
+        if (date.getTime() !== trip.actualArrivalTime?.getTime()) {
+          changes.set("actualArrivalTime", { from: trip.actualArrivalTime, to: date });
+          trip.actualArrivalTime = date;
+        }
+      }
 
       if (origin && origin !== trip.origin) {
         changes.set("origin", { from: trip.origin, to: origin });
